@@ -11,7 +11,6 @@ use std::sync::Arc;
 pub struct WalletWorker {
     pub address: String,
     pub address_alloy: Address,
-    pub signer: PrivateKeySigner,
     pub nonce_mgr: Arc<NonceManager>,
     pub key: ProtectedKey,
 }
@@ -26,7 +25,6 @@ impl WalletWorker {
         Ok(Self {
             address: addr_str,
             address_alloy: addr,
-            signer,
             nonce_mgr,
             key,
         })
@@ -62,7 +60,8 @@ impl WalletWorker {
 
         // Compute EIP-1559 signature hash
         let sighash = tx.signature_hash();
-        let signature = self.signer.sign_hash_sync(&sighash)?;
+        let signer = create_signer_from_protected(&self.key)?;
+        let signature = signer.sign_hash_sync(&sighash)?;
         let signed_tx = tx.into_signed(signature);
 
         // Encode into standard EIP-2718 typed transaction payload

@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use rand::RngCore;
+use zeroize::Zeroize;
 
 use crate::config::AppConfig;
 use crate::sniper::SnipeTrigger;
@@ -68,10 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             "2" => {
                 println!("\n--- Generate Wallet ---");
-                print!("Enter new master passphrase: ");
-                io::stdout().flush()?;
-                let mut pass = String::new();
-                io::stdin().read_line(&mut pass)?;
+                let mut pass = rpassword::prompt_password("Enter new master passphrase: ").unwrap_or_default();
                 
                 let mut key_bytes = [0u8; 32];
                 rand::rngs::OsRng.fill_bytes(&mut key_bytes);
@@ -82,30 +80,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let path = Path::new("./keystores").join(format!("{}.json", address));
                 encrypt_key_to_file(&key, &address, pass.trim(), &path)?;
                 
+                pass.zeroize();
+
                 println!("✅ Successfully generated and encrypted wallet!");
                 println!("Public Address: {}", address);
                 println!("Keystore Path: {}", path.display());
             }
             "3" => {
                 println!("\n--- Import Wallet ---");
-                print!("Paste your raw private key (Hex): ");
-                io::stdout().flush()?;
-                let mut pk_hex = String::new();
-                io::stdin().read_line(&mut pk_hex)?;
-                let pk_hex = pk_hex.trim().trim_start_matches("0x");
+                let mut pk_input = rpassword::prompt_password("Paste your raw private key (Hex): ").unwrap_or_default();
+                let clean_hex = pk_input.trim().trim_start_matches("0x");
                 
-                if pk_hex.len() != 64 {
+                if clean_hex.len() != 64 {
                     println!("❌ Invalid private key length. Must be 64 hex characters.");
+                    pk_input.zeroize();
                     continue;
                 }
                 
                 let mut key_bytes = [0u8; 32];
-                match hex::decode_to_slice(pk_hex, &mut key_bytes) {
+                match hex::decode_to_slice(clean_hex, &mut key_bytes) {
                     Ok(_) => {
-                        print!("Enter Master Passphrase to encrypt this key: ");
-                        io::stdout().flush()?;
-                        let mut pass = String::new();
-                        io::stdin().read_line(&mut pass)?;
+                        let mut pass = rpassword::prompt_password("Enter Master Passphrase to encrypt this key: ").unwrap_or_default();
                         
                         let key = ProtectedKey::new(key_bytes);
                         let address = get_address_from_protected(&key)?;
@@ -113,14 +108,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let path = Path::new("./keystores").join(format!("{}.json", address));
                         encrypt_key_to_file(&key, &address, pass.trim(), &path)?;
                         
+                        pass.zeroize();
                         println!("✅ Successfully imported and encrypted wallet!");
                         println!("Public Address: {}", address);
                     }
                     Err(_) => println!("❌ Invalid hex characters in private key."),
                 }
                 
-                // Clear the hex from memory immediately
-                pk_hex.to_string().clear(); 
+                // Securely wipe the hex from memory
+                pk_input.zeroize();
             }
             "4" => {
                 println!("\n--- Configuration Wizard ---");
@@ -172,19 +168,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _gas_engine = crate::gas::GasEngine::new(config.gas.hard_gas_ceiling_gwei, config.gas.max_priority_fee_gwei, config.gas.speedup_bump_percent);
     
     // Decrypt wallets securely into memory
-    print!("\n🔑 Enter master passphrase to unlock configured wallets: ");
-    io::stdout().flush()?;
-    let mut password = String::new();
-    io::stdin().read_line(&mut password)?;
-    let password = password.trim();
+    let mut password = rpassword::prompt_password("\n🔑 Enter master passphrase to unlock configured wallets: ").unwrap_or_default();
+    let password_trim = password.trim();
 
     let mut workers = Vec::new();
     for path in &config.wallets.keystore_paths {
         let p = Path::new(path);
         if p.exists() {
-            match crate::crypto::decrypt_key_from_file(p, password) {
+            match crate::crypto::decrypt_key_from_file(p, password_trim) {
                 Ok((key, addr)) => {
                     if let Ok(worker) = crate::wallet::WalletWorker::new(key, 0) {
+                        if worker.address.to_lowercase() != addr.to_lowercase() {
+                            println!("❌ CRITICAL: Keystore address spoofing detected! Derived: {} != Keystore: {}", worker.address, addr);
+                            continue;
+                        }
                         workers.push(Arc::new(worker));
                         println!("🔓 Unlocked wallet: {}", addr);
                     }
@@ -195,6 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("⚠️ Configured keystore not found: {}", path);
         }
     }
+    password.zeroize();
 
     if workers.is_empty() {
         println!("❌ No active wallets loaded. Please generate or import a wallet via the wizard first.");
@@ -292,6 +290,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         terminal.draw(|f| draw_ui(f, &state))?;
 
         tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                break; // Break the loop so workers go out of scope and trigger Drop
+            }
             Some(event) = events.next() => {
                 match event {
                     AppEvent::Input(key) => state.handle_key(key.code),
@@ -321,10 +322,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let max_fee_wei = crate::gas::gwei_to_wei(config.gas.max_fee_gwei);
                     let max_priority_fee_wei = crate::gas::gwei_to_wei(config.gas.max_priority_fee_gwei);
 
-                    // Touch NonceManager methods to clear dead code
-                    let current_nonce = worker.nonce_mgr.current();
-                    worker.nonce_mgr.set_nonce(current_nonce + 1);
-
+                    // Removed premature nonce increment
                     match worker.build_and_sign_eip1559(
                         config.chain.chain_id,
                         &target_contract,
@@ -338,25 +336,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         Ok((raw_tx, nonce)) => {
                             state.add_log(format!("🚀 Signed tx for {} (Nonce: {})", worker.address, nonce));
                             
-                            // Broadcast concurrently via RPC Racer
-                            let racer = rpc_racer_clone.clone();
-                            let raw_tx_clone = raw_tx.clone();
-                            
-                            tokio::spawn(async move {
-                                let outcomes = racer.race_broadcast_raw_tx(&raw_tx_clone).await;
-                                for outcome in outcomes {
-                                    if outcome.success {
-                                        // Valid
-                                    }
-                                }
-                            });
-
                             // Broadcast via MEV Builder if active
                             if let Some(mev) = &mev_client {
                                 let mev_clone = mev.clone();
                                 let tx_clone = raw_tx.clone();
+                                let racer_fallback = rpc_racer_clone.clone();
                                 tokio::spawn(async move {
-                                    let _outcomes = mev_clone.send_private_transaction(&tx_clone).await;
+                                    let outcomes = mev_clone.send_private_transaction(&tx_clone).await;
+                                    let mut any_success = false;
+                                    for outcome in &outcomes {
+                                        if outcome.success {
+                                            any_success = true;
+                                        }
+                                    }
+                                    if !any_success {
+                                        // Fallback to public RPC if all MEV builders reject the transaction
+                                        let _ = racer_fallback.race_broadcast_raw_tx(&tx_clone).await;
+                                    }
+                                });
+                            } else {
+                                // Broadcast concurrently via public RPC Racer
+                                let racer = rpc_racer_clone.clone();
+                                let raw_tx_clone = raw_tx.clone();
+                                
+                                tokio::spawn(async move {
+                                    let outcomes = racer.race_broadcast_raw_tx(&raw_tx_clone).await;
+                                    for outcome in outcomes {
+                                        if outcome.success {
+                                            // Valid
+                                        }
+                                    }
                                 });
                             }
                         }

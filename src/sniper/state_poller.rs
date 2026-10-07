@@ -51,8 +51,8 @@ impl StatePoller {
                 if let Ok(body) = resp.json::<Value>().await {
                     if let Some(result_hex) = body.get("result").and_then(|r| r.as_str()) {
                         let clean = result_hex.trim_start_matches("0x");
-                        // If it's a bool, true is represented by ending in 1
-                        if clean.ends_with('1') {
+                        // Exactly match a 32-byte (64 hex char) boolean true
+                        if clean == "0000000000000000000000000000000000000000000000000000000000000001" {
                             info!("StatePoller detected sale is now active on contract: {}", self.target_contract);
                             let _ = trigger_tx.send(SnipeTrigger::StateFlipDetected { new_state: true }).await;
                             return;

@@ -97,9 +97,17 @@ pub fn encrypt_key_to_file(
 
     let serialized = serde_json::to_string_pretty(&keystore)?;
     if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent)?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
     }
-    fs::write(dest_path, serialized)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dest_path)?;
+    std::io::Write::write_all(&mut file, serialized.as_bytes())?;
 
     Ok(())
 }
@@ -138,7 +146,7 @@ pub fn decrypt_key_from_file(
     nonce_arr.copy_from_slice(&nonce_bytes);
     let nonce = Nonce::from(nonce_arr);
     
-    let plaintext = cipher
+    let mut plaintext = cipher
         .decrypt(&nonce, ciphertext_bytes.as_slice())
         .map_err(|_| "Failed to decrypt keystore: invalid passphrase or corrupt data")?;
 
@@ -147,11 +155,13 @@ pub fn decrypt_key_from_file(
     derived_key.zeroize();
 
     if plaintext.len() != 32 {
+        plaintext.zeroize();
         return Err("Decrypted key payload is not 32 bytes".into());
     }
 
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&plaintext);
+    plaintext.zeroize();
 
     let protected = ProtectedKey::new(key_bytes);
     Ok((protected, keystore.address))

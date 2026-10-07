@@ -1,6 +1,8 @@
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::Signer;
 
 #[derive(Debug, Clone)]
 pub struct BuilderOutcome {
@@ -14,6 +16,7 @@ pub struct BuilderOutcome {
 pub struct MevBuilderClient {
     client: Client,
     builder_urls: Vec<String>,
+    mev_identity: PrivateKeySigner,
 }
 
 impl MevBuilderClient {
@@ -28,6 +31,7 @@ impl MevBuilderClient {
         Self {
             client,
             builder_urls: builder_urls.to_vec(),
+            mev_identity: PrivateKeySigner::random(),
         }
     }
 
@@ -46,6 +50,7 @@ impl MevBuilderClient {
             let client = self.client.clone();
             let builder_url = url.clone();
             let tx_hex = raw_hex.clone();
+            let mev_identity = self.mev_identity.clone();
 
             handles.push(tokio::spawn(async move {
                 let start = Instant::now();
@@ -61,45 +66,59 @@ impl MevBuilderClient {
                         }
                     }]
                 });
+                
+                let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+                let sig_result = mev_identity.sign_message(alloy::primitives::keccak256(payload_str.as_bytes()).as_slice()).await;
+                if let Ok(sig) = sig_result {
+                    let auth_header = format!("{:?}:0x{}", mev_identity.address(), hex::encode(sig.as_bytes()));
 
-                match client.post(&builder_url).json(&payload).send().await {
-                    Ok(resp) => {
-                        let duration_ms = start.elapsed().as_millis() as u64;
-                        if let Ok(body) = resp.json::<Value>().await {
-                            if let Some(err) = body.get("error") {
-                                BuilderOutcome {
-                                    builder_url,
-                                    duration_ms,
-                                    success: false,
-                                    response: None,
-                                    error: Some(err.to_string()),
+                    match client.post(&builder_url).header("X-Flashbots-Signature", auth_header).json(&payload).send().await {
+                        Ok(resp) => {
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            if let Ok(body) = resp.json::<Value>().await {
+                                if let Some(err) = body.get("error") {
+                                    BuilderOutcome {
+                                        builder_url,
+                                        duration_ms,
+                                        success: false,
+                                        response: None,
+                                        error: Some(err.to_string()),
+                                    }
+                                } else {
+                                    BuilderOutcome {
+                                        builder_url,
+                                        duration_ms,
+                                        success: true,
+                                        response: body.get("result").map(|r| r.to_string()),
+                                        error: None,
+                                    }
                                 }
                             } else {
                                 BuilderOutcome {
                                     builder_url,
                                     duration_ms,
-                                    success: true,
-                                    response: body.get("result").map(|r| r.to_string()),
-                                    error: None,
+                                    success: false,
+                                    response: None,
+                                    error: Some("Failed to decode response".to_string()),
                                 }
                             }
-                        } else {
-                            BuilderOutcome {
-                                builder_url,
-                                duration_ms,
-                                success: false,
-                                response: None,
-                                error: Some("Failed to decode response".to_string()),
-                            }
                         }
+                        Err(e) => BuilderOutcome {
+                            builder_url,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            success: false,
+                            response: None,
+                            error: Some(e.to_string()),
+                        },
                     }
-                    Err(e) => BuilderOutcome {
+                } else {
+                    BuilderOutcome {
                         builder_url,
                         duration_ms: start.elapsed().as_millis() as u64,
                         success: false,
                         response: None,
-                        error: Some(e.to_string()),
-                    },
+                        error: Some("Failed to sign payload for builder".to_string()),
+                    }
                 }
             }));
         }

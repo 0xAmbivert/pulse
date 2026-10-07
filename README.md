@@ -23,11 +23,11 @@
 * **Fort Knox at Rest:** Uses standard-defining `Argon2id` + `AES-256-GCM` encrypted keystores.
 * **Pinned RAM (`mlock`):** Prevents the OS from *ever* writing your private keys to disk or swap partitions.
 * **Poof! (`zeroize`):** Automatic memory scrubbing the exact millisecond the bot terminates.
-* **Blazing Signatures:** Sub-microsecond local `secp256k1` signing. *Zero* network latency added for signatures!
+* **Blazing Signatures:** Ultra-fast local `secp256k1` signing (~150 µs). *Zero* network latency added for signatures!
 
 ### 🏎️ Parallel RPC Racing
 * **Multi-Route Broadcasting:** Blasts your signed transaction payload concurrently across multiple WebSocket/HTTP RPCs simultaneously!
-* **Dark Forest Mastery:** Native support for **MEV Block Builder** direct relays (Flashbots, Titan, BeaverBuild) to bypass the public mempool, stop frontrunners, and guarantee top-of-block inclusion. 🥷
+* **Dark Forest Mastery:** Native support for **MEV Block Builder** direct relays (Flashbots, Titan) to bypass the public mempool, stop frontrunners, and guarantee top-of-block inclusion. 🥷
 
 ### 🎯 Sub-Millisecond Sniping Engines
 * 🕵️ **Mempool Backrun:** Stalks the pending mempool for the owner's transaction (e.g. `setPublicSaleActive()`) and fires your mint *in the exact same block* right behind it!

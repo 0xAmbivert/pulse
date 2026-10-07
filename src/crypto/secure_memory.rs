@@ -7,7 +7,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// - Does not implement `Clone` or `Debug` (prevents accidental duplication or logging).
 #[derive(Zeroize)]
 pub struct ProtectedKey {
-    bytes: [u8; 32],
+    bytes: Box<[u8; 32]>,
     #[zeroize(skip)]
     is_locked: bool,
 }
@@ -16,7 +16,7 @@ impl ProtectedKey {
     /// Creates a new `ProtectedKey` from a 32-byte slice, pinning the memory in RAM.
     pub fn new(key_bytes: [u8; 32]) -> Self {
         let mut key = Self {
-            bytes: key_bytes,
+            bytes: Box::new(key_bytes),
             is_locked: false,
         };
         key.lock_memory();
@@ -49,9 +49,7 @@ impl ProtectedKey {
             if libc::mlock(ptr, len) == 0 {
                 self.is_locked = true;
             } else {
-                // If mlock fails (e.g. RLIMIT_MEMLOCK exceeded), we log or silently continue,
-                // while ZeroizeOnDrop still guarantees memory scrubbing upon drop.
-                self.is_locked = false;
+                panic!("FATAL: Failed to mlock private key memory (RLIMIT_MEMLOCK exceeded?). OS swap leak possible. Aborting.");
             }
         }
     }
@@ -80,7 +78,7 @@ impl Drop for ProtectedKey {
             }
         }
         // Zeroize is explicitly called
-        self.bytes.zeroize();
+        self.bytes.as_mut().zeroize();
     }
 }
 

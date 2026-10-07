@@ -68,7 +68,6 @@ impl Default for AppConfig {
                 mev_builder_urls: vec![
                     "https://relay.flashbots.net".to_string(),
                     "https://rpc.titanbuilder.xyz".to_string(),
-                    "https://rpc.beaverbuild.org".to_string(),
                 ],
                 rpc_timeout_ms: 2000,
             },
