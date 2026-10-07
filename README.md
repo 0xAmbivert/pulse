@@ -64,42 +64,41 @@ cargo build --release
 
 ## 🛠️ Quick Start Guide
 
-### 1️⃣ Launch the Interactive Setup Wizard
+### 1️⃣ Launch Pulse
 
-Forget manually editing TOML files. Simply launch the bot for the first time, and the **Setup Wizard** will guide you through configuring your drop:
-
-```bash
-cargo run --release
-```
-
-**The wizard will ask you for:**
-* **Chain ID:** (e.g. `1` for ETH, `8453` for Base, `42161` for Arbitrum)
-* **RPC URL:** Your premium endpoint (e.g. Alchemy, QuickNode, local node).
-* **Target Contract:** The address of the NFT contract.
-* **Max Gas Fee:** The maximum Gwei you are willing to pay during a gas war.
-
-*Once answered, it automatically generates the `config.toml` for you!*
-
-### 2️⃣ Forge a Secure Wallet
-
-Never put raw private keys into plaintext files! Generate a military-grade AES-encrypted keystore directly from the CLI:
-
-```bash
-cargo run --release -- --generate-wallet
-```
-1. You will be prompted to set a **Master Passphrase**. 🤫
-2. The bot generates a completely random secure Ethereum wallet and stores it in `./keystores/<address>.json`.
-3. Copy the outputted public address and **fund it** with the native gas token of your target chain! 💸
-4. The bot automatically detects `.json` files inside the `./keystores` directory on startup.
-
-### 3️⃣ Arm the Snipers (Run the Bot)
-
-Once your wallet is funded and config is locked in, wake the bot up:
+Forget manually typing CLI flags or editing TOML files. Pulse features a seamless interactive **Main Menu Wizard**. Just run:
 
 ```bash
 cargo run --release
 ```
-* The bot will ask for your Master Passphrase to securely decrypt the keys into RAM. 🧠
+
+You will be greeted with the Main Menu:
+```text
+===============================
+        🚀 Pulse 🚀          
+===============================
+1. 🟢 Start Sniping Engine
+2. ➕ Generate New Wallet
+3. 📥 Import Private Key
+4. ⚙️  Setup / Edit Config
+5. ❌ Exit
+👉 Choose an option: 
+```
+
+### 2️⃣ Forge or Import a Secure Wallet
+* **Press 2** to let Pulse generate a completely random secure Ethereum wallet. 
+* **Press 3** to securely import your own raw private key.
+
+*You will be prompted to set a **Master Passphrase**. The bot locks your key behind military-grade AES encryption in `./keystores/<address>.json` and zeroes the raw string from RAM immediately.*
+
+### 3️⃣ Configure the Drop
+* **Press 4** to launch the interactive Configuration Wizard.
+* The bot will ask for your target Chain ID, RPC URL, NFT Contract Address, and maximum Gas limits.
+* *Once answered, it automatically generates the `config.toml` for you!*
+
+### 4️⃣ Arm the Snipers
+* **Press 1** to start the engine.
+* Enter your Master Passphrase to securely decrypt the keys back into pinned RAM. 🧠
 * You will instantly drop into the **Live Terminal Dashboard**! 🎛️
 * The Snipers will arm themselves and await the drop trigger. When the condition hits, the bot signs locally and parallel-broadcasts to all configured RPC and MEV endpoints in a fraction of a millisecond! 💥
 
