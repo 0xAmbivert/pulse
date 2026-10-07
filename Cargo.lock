@@ -2319,36 +2319,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "evm-mint-bot"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "alloy",
- "anyhow",
- "argon2",
- "chrono",
- "clap",
- "crossterm",
- "futures",
- "futures-util",
- "hex",
- "libc",
- "rand 0.8.8",
- "ratatui",
- "reqwest 0.12.28",
- "revm",
- "secrecy",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "zeroize",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3969,6 +3939,36 @@ dependencies = [
  "rand_xorshift",
  "regex-syntax",
  "unarray",
+]
+
+[[package]]
+name = "pulse"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "alloy",
+ "anyhow",
+ "argon2",
+ "chrono",
+ "clap",
+ "crossterm",
+ "futures",
+ "futures-util",
+ "hex",
+ "libc",
+ "rand 0.8.8",
+ "ratatui",
+ "reqwest 0.12.28",
+ "revm",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

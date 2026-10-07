@@ -31,69 +31,134 @@ struct Cli {
     /// Path to configuration file
     #[arg(short, long, value_name = "FILE", default_value = "config.toml")]
     config: PathBuf,
-
-    /// Generate a new AES-256-GCM encrypted keystore file
-    #[arg(long)]
-    generate_wallet: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
     
-    // Interactive Setup Wizard if config doesn't exist
-    if !cli.config.exists() && !cli.generate_wallet {
-        println!("✨ No config file found. Let's set up your bot!");
-        let mut config = AppConfig::default();
-        
-        print!("🔗 Enter Chain ID (e.g., 1 for ETH, 8453 for Base): ");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        config.chain.chain_id = input.trim().parse().unwrap_or(1);
-
-        print!("🌐 Enter RPC URL (WebSocket or HTTP): ");
-        io::stdout().flush()?;
-        input.clear();
-        io::stdin().read_line(&mut input)?;
-        config.chain.rpc_urls = vec![input.trim().to_string()];
-
-        print!("🎯 Enter Target NFT Contract Address: ");
-        io::stdout().flush()?;
-        input.clear();
-        io::stdin().read_line(&mut input)?;
-        config.drop.target_contract = input.trim().to_string();
-
-        print!("💰 Enter Max Gas Fee in Gwei (e.g., 50.0): ");
-        io::stdout().flush()?;
-        input.clear();
-        io::stdin().read_line(&mut input)?;
-        config.gas.max_fee_gwei = input.trim().parse().unwrap_or(50.0);
-        
-        config.save_to_file(&cli.config)?;
-        println!("✅ Config saved to {}!\n", cli.config.display());
+    // Create default config silently if it doesn't exist so load won't fail
+    if !cli.config.exists() {
+        AppConfig::default().save_to_file(&cli.config)?;
     }
 
-    if cli.generate_wallet {
-        println!("Generating new secure wallet...");
-        print!("Enter new master passphrase: ");
+    loop {
+        println!("\n===============================");
+        println!("        🚀 Pulse 🚀          ");
+        println!("===============================");
+        println!("1. 🟢 Start Sniping Engine");
+        println!("2. ➕ Generate New Wallet");
+        println!("3. 📥 Import Private Key");
+        println!("4. ⚙️  Setup / Edit Config");
+        println!("5. ❌ Exit");
+        print!("👉 Choose an option: ");
         io::stdout().flush()?;
-        let mut pass = String::new();
-        io::stdin().read_line(&mut pass)?;
-        let pass = pass.trim();
+        
+        let mut choice = String::new();
+        io::stdin().read_line(&mut choice)?;
+        
+        match choice.trim() {
+            "1" => {
+                println!("Booting Sniping Engine...");
+                break;
+            }
+            "2" => {
+                println!("\n--- Generate Wallet ---");
+                print!("Enter new master passphrase: ");
+                io::stdout().flush()?;
+                let mut pass = String::new();
+                io::stdin().read_line(&mut pass)?;
+                
+                let mut key_bytes = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut key_bytes);
+                let key = ProtectedKey::new(key_bytes);
+                let address = get_address_from_protected(&key)?;
+                
+                std::fs::create_dir_all("./keystores").unwrap_or_default();
+                let path = Path::new("./keystores").join(format!("{}.json", address));
+                encrypt_key_to_file(&key, &address, pass.trim(), &path)?;
+                
+                println!("✅ Successfully generated and encrypted wallet!");
+                println!("Public Address: {}", address);
+                println!("Keystore Path: {}", path.display());
+            }
+            "3" => {
+                println!("\n--- Import Wallet ---");
+                print!("Paste your raw private key (Hex): ");
+                io::stdout().flush()?;
+                let mut pk_hex = String::new();
+                io::stdin().read_line(&mut pk_hex)?;
+                let pk_hex = pk_hex.trim().trim_start_matches("0x");
+                
+                if pk_hex.len() != 64 {
+                    println!("❌ Invalid private key length. Must be 64 hex characters.");
+                    continue;
+                }
+                
+                let mut key_bytes = [0u8; 32];
+                match hex::decode_to_slice(pk_hex, &mut key_bytes) {
+                    Ok(_) => {
+                        print!("Enter Master Passphrase to encrypt this key: ");
+                        io::stdout().flush()?;
+                        let mut pass = String::new();
+                        io::stdin().read_line(&mut pass)?;
+                        
+                        let key = ProtectedKey::new(key_bytes);
+                        let address = get_address_from_protected(&key)?;
+                        std::fs::create_dir_all("./keystores").unwrap_or_default();
+                        let path = Path::new("./keystores").join(format!("{}.json", address));
+                        encrypt_key_to_file(&key, &address, pass.trim(), &path)?;
+                        
+                        println!("✅ Successfully imported and encrypted wallet!");
+                        println!("Public Address: {}", address);
+                    }
+                    Err(_) => println!("❌ Invalid hex characters in private key."),
+                }
+                
+                // Clear the hex from memory immediately
+                pk_hex.to_string().clear(); 
+            }
+            "4" => {
+                println!("\n--- Configuration Wizard ---");
+                let mut config = AppConfig::default();
+                
+                print!("🔗 Enter Chain ID (e.g., 1 for ETH, 8453 for Base): ");
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                config.chain.chain_id = input.trim().parse().unwrap_or(1);
 
-        let mut key_bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut key_bytes);
-        let key = ProtectedKey::new(key_bytes);
-        let address = get_address_from_protected(&key)?;
-        
-        let path = Path::new("./keystores").join(format!("{}.json", address));
-        encrypt_key_to_file(&key, &address, pass, &path)?;
-        
-        println!("✅ Successfully generated and encrypted wallet!");
-        println!("Public Address: {}", address);
-        println!("Keystore Path: {}", path.display());
-        return Ok(());
+                print!("🌐 Enter RPC URL (WebSocket or HTTP): ");
+                io::stdout().flush()?;
+                input.clear();
+                io::stdin().read_line(&mut input)?;
+                if !input.trim().is_empty() {
+                    config.chain.rpc_urls = vec![input.trim().to_string()];
+                }
+
+                print!("🎯 Enter Target NFT Contract Address: ");
+                io::stdout().flush()?;
+                input.clear();
+                io::stdin().read_line(&mut input)?;
+                if !input.trim().is_empty() {
+                    config.drop.target_contract = input.trim().to_string();
+                }
+
+                print!("💰 Enter Max Gas Fee in Gwei (e.g., 50.0): ");
+                io::stdout().flush()?;
+                input.clear();
+                io::stdin().read_line(&mut input)?;
+                config.gas.max_fee_gwei = input.trim().parse().unwrap_or(50.0);
+                
+                config.save_to_file(&cli.config)?;
+                println!("✅ Config saved to {}!", cli.config.display());
+            }
+            "5" => {
+                println!("Goodbye!");
+                return Ok(());
+            }
+            _ => println!("❌ Invalid option. Try again."),
+        }
     }
 
     let config = AppConfig::load_from_file(&cli.config)?;
@@ -103,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _gas_engine = crate::gas::GasEngine::new(config.gas.hard_gas_ceiling_gwei, config.gas.max_priority_fee_gwei, config.gas.speedup_bump_percent);
     
     // Decrypt wallets securely into memory
-    print!("🔑 Enter master passphrase to unlock configured wallets: ");
+    print!("\n🔑 Enter master passphrase to unlock configured wallets: ");
     io::stdout().flush()?;
     let mut password = String::new();
     io::stdin().read_line(&mut password)?;
@@ -113,17 +178,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for path in &config.wallets.keystore_paths {
         let p = Path::new(path);
         if p.exists() {
-            let (key, addr) = crate::crypto::decrypt_key_from_file(p, password)?;
-            let worker = crate::wallet::WalletWorker::new(key, 0)?; // Initializing with 0, will resync naturally
-            workers.push(Arc::new(worker));
-            println!("🔓 Unlocked wallet: {}", addr);
+            match crate::crypto::decrypt_key_from_file(p, password) {
+                Ok((key, addr)) => {
+                    if let Ok(worker) = crate::wallet::WalletWorker::new(key, 0) {
+                        workers.push(Arc::new(worker));
+                        println!("🔓 Unlocked wallet: {}", addr);
+                    }
+                }
+                Err(_) => println!("❌ Failed to decrypt wallet {}. Wrong password?", p.display()),
+            }
         } else {
             println!("⚠️ Configured keystore not found: {}", path);
         }
     }
 
     if workers.is_empty() {
-        println!("❌ No active wallets loaded. Please generate a wallet or check config.toml");
+        println!("❌ No active wallets loaded. Please generate or import a wallet via the wizard first.");
         return Ok(());
     }
 
