@@ -57,7 +57,7 @@ pub fn draw_ui(f: &mut Frame, state: &DashboardState) {
 
     // Header
     let header = Paragraph::new(format!(
-        " EVM Apex Mint Bot | Target: {} | Press 'q' to quit",
+        " Pulse | Target: {} | Press 'q' to quit",
         state.target_contract
     ))
     .style(

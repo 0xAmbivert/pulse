@@ -1,5 +1,5 @@
 <h1 align="center">
-  🚀 EVM Apex Mint Bot 🚀
+  🚀 Pulse 🚀
 </h1>
 
 <p align="center">
@@ -51,10 +51,10 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ### Clone & Build
 ```bash
 # 1. Clone the repository
-git clone https://github.com/0xAmbivert/evm-apex-mint-bot.git
+git clone https://github.com/0xAmbivert/pulse.git
 
 # 2. Enter the directory
-cd evm-apex-mint-bot
+cd pulse
 
 # 3. Build the highly-optimized release binary
 cargo build --release
