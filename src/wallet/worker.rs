@@ -48,7 +48,7 @@ impl WalletWorker {
         let target_addr = Address::from_str(to_address)?;
         let nonce = explicit_nonce.unwrap_or_else(|| self.nonce_mgr.get_and_increment());
 
-        let mut tx = TxEip1559 {
+        let tx = TxEip1559 {
             chain_id,
             nonce,
             gas_limit,

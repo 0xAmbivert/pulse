@@ -1,0 +1,37 @@
+[chain]
+chain_id = 1
+name = "Ethereum Mainnet"
+rpc_urls = [
+    "https://eth.llamarpc.com",
+    "https://rpc.payload.de",
+]
+mev_builder_urls = [
+    "https://relay.flashbots.net",
+    "https://rpc.titanbuilder.xyz",
+    "https://rpc.beaverbuild.org",
+]
+rpc_timeout_ms = 2000
+
+[drop]
+target_contract = "0x0000000000000000000000000000000000000000"
+mint_function = "mint(uint256)"
+mint_value_wei = "0"
+flip_function_signatures = [
+    "setPublicSaleActive(bool)",
+    "flipSaleState()",
+    "unpause()",
+]
+
+[gas]
+max_fee_gwei = 50.0
+max_priority_fee_gwei = 3.0
+gas_limit = 150000
+auto_speedup = true
+speedup_threshold_ms = 12000
+speedup_bump_percent = 15
+hard_gas_ceiling_gwei = 150.0
+
+[wallets]
+keystore_paths = ["./keystores/wallet_01.json"]
+
+[alerts]
