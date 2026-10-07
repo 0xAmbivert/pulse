@@ -40,6 +40,14 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
                 let path = Path::new("./keystores").join(format!("{}.json", address));
                 encrypt_key_to_file(&key, &address, pass.trim(), &path)?;
 
+                if let Ok(mut config) = AppConfig::load_from_file(config_path) {
+                    let path_str = path.to_string_lossy().to_string();
+                    if !config.wallets.keystore_paths.contains(&path_str) {
+                        config.wallets.keystore_paths.push(path_str);
+                        let _ = config.save_to_file(config_path);
+                    }
+                }
+
                 pass.zeroize();
                 println!("✅ Successfully generated and encrypted wallet!");
                 println!("Public Address: {}", address);
@@ -64,6 +72,14 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
                         std::fs::create_dir_all("./keystores").unwrap_or_default();
                         let path = Path::new("./keystores").join(format!("{}.json", address));
                         encrypt_key_to_file(&key, &address, pass.trim(), &path)?;
+
+                        if let Ok(mut config) = AppConfig::load_from_file(config_path) {
+                            let path_str = path.to_string_lossy().to_string();
+                            if !config.wallets.keystore_paths.contains(&path_str) {
+                                config.wallets.keystore_paths.push(path_str);
+                                let _ = config.save_to_file(config_path);
+                            }
+                        }
 
                         pass.zeroize();
                         println!("✅ Successfully imported and encrypted wallet!");

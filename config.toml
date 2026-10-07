@@ -2,8 +2,8 @@
 chain_id = 1
 name = "Ethereum Mainnet"
 rpc_urls = [
-    "https://eth.llamarpc.com",
-    "https://rpc.payload.de",
+    "https://ethereum-rpc.publicnode.com",
+    "https://1rpc.io/eth",
 ]
 mev_builder_urls = [
     "https://relay.flashbots.net",

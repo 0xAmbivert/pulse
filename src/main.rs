@@ -103,6 +103,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+        println!("✅ Wallet and network components successfully verified!");
+        println!("ℹ️ The dashboard requires an interactive TTY.");
+        println!("🚀 Run directly in your terminal: ./target/release/pulse");
+        return Ok(());
+    }
+
     // Setup Terminal UI
     std::panic::set_hook(Box::new(|info| {
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
