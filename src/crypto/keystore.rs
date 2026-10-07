@@ -65,13 +65,13 @@ pub fn encrypt_key_to_file(
     // Generate random 12-byte (96-bit) nonce for AES-256-GCM
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
     let cipher = Aes256Gcm::new_from_slice(&derived_key)
         .map_err(|e| format!("Cipher init error: {e}"))?;
 
     let ciphertext = cipher
-        .encrypt(nonce, key.as_bytes().as_slice())
+        .encrypt(&nonce, key.as_bytes().as_slice())
         .map_err(|e| format!("Encryption error: {e}"))?;
 
     // Zeroize derived key in RAM
@@ -134,9 +134,12 @@ pub fn decrypt_key_from_file(
     let cipher = Aes256Gcm::new_from_slice(&derived_key)
         .map_err(|e| format!("Cipher init error: {e}"))?;
 
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let mut nonce_arr = [0u8; 12];
+    nonce_arr.copy_from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_arr);
+    
     let plaintext = cipher
-        .decrypt(nonce, ciphertext_bytes.as_slice())
+        .decrypt(&nonce, ciphertext_bytes.as_slice())
         .map_err(|_| "Failed to decrypt keystore: invalid passphrase or corrupt data")?;
 
     // Zeroize derived key in RAM
