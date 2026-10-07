@@ -13,14 +13,19 @@ pub struct ProtectedKey {
 }
 
 impl ProtectedKey {
-    /// Creates a new `ProtectedKey` from a 32-byte slice, pinning the memory in RAM.
-    pub fn new(key_bytes: [u8; 32]) -> Self {
+    /// Allocates an empty 32-byte pinned heap buffer.
+    pub fn empty() -> Self {
         let mut key = Self {
-            bytes: Box::new(key_bytes),
+            bytes: Box::new([0u8; 32]),
             is_locked: false,
         };
         key.lock_memory();
         key
+    }
+
+    /// Mutably borrow the underlying pinned buffer to securely copy data directly into it without stack copies.
+    pub fn as_mut_bytes(&mut self) -> &mut [u8; 32] {
+        self.bytes.as_mut()
     }
 
     /// Attempts to parse a 64-character hex string (with or without 0x prefix).
@@ -33,11 +38,11 @@ impl ProtectedKey {
             ));
         }
 
-        let mut bytes = [0u8; 32];
-        hex::decode_to_slice(clean_hex, &mut bytes)
+        let mut key = Self::empty();
+        hex::decode_to_slice(clean_hex, key.as_mut_bytes())
             .map_err(|e| format!("Invalid hex encoding for private key: {e}"))?;
 
-        Ok(Self::new(bytes))
+        Ok(key)
     }
 
     /// Locks the underlying memory buffer using `libc::mlock` to ensure the OS never writes it to swap.
@@ -49,7 +54,7 @@ impl ProtectedKey {
             if libc::mlock(ptr, len) == 0 {
                 self.is_locked = true;
             } else {
-                panic!("FATAL: Failed to mlock private key memory (RLIMIT_MEMLOCK exceeded?). OS swap leak possible. Aborting.");
+                eprintln!("WARNING: Failed to mlock private key memory (RLIMIT_MEMLOCK exceeded?). Key is isolated to heap but may be swapped.");
             }
         }
     }

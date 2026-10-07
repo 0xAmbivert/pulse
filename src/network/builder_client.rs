@@ -66,13 +66,17 @@ impl MevBuilderClient {
                         }
                     }]
                 });
-                
                 let payload_str = serde_json::to_string(&payload).unwrap_or_default();
-                let sig_result = mev_identity.sign_message(alloy::primitives::keccak256(payload_str.as_bytes()).as_slice()).await;
+                let sig_result = mev_identity.sign_message(payload_str.as_bytes()).await;
                 if let Ok(sig) = sig_result {
-                    let auth_header = format!("{:?}:0x{}", mev_identity.address(), hex::encode(sig.as_bytes()));
+                    let addr_hex = format!("{:#x}", mev_identity.address());
+                    let auth_header = format!("{}:0x{}", addr_hex, hex::encode(sig.as_bytes()));
 
-                    match client.post(&builder_url).header("X-Flashbots-Signature", auth_header).json(&payload).send().await {
+                    match client.post(&builder_url)
+                        .header("X-Flashbots-Signature", auth_header)
+                        .header("Content-Type", "application/json")
+                        .body(payload_str)
+                        .send().await {
                         Ok(resp) => {
                             let duration_ms = start.elapsed().as_millis() as u64;
                             if let Ok(body) = resp.json::<Value>().await {

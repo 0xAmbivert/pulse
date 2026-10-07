@@ -80,9 +80,9 @@ impl Default for AppConfig {
                 target_block: None,
                 monitor_owner_address: None,
                 flip_function_signatures: vec![
-                    "setPublicSaleActive(bool)".to_string(),
-                    "flipSaleState()".to_string(),
-                    "unpause()".to_string(),
+                    "isPublicSaleActive()".to_string(),
+                    "publicSaleActive()".to_string(),
+                    "saleIsActive()".to_string(),
                 ],
             },
             gas: GasConfig {
@@ -118,7 +118,24 @@ impl AppConfig {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, content)?;
+        
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?;
+            std::io::Write::write_all(&mut file, content.as_bytes())?;
+        }
+        
+        #[cfg(not(unix))]
+        {
+            fs::write(path, content)?;
+        }
+
         Ok(())
     }
 }

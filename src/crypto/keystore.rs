@@ -159,10 +159,9 @@ pub fn decrypt_key_from_file(
         return Err("Decrypted key payload is not 32 bytes".into());
     }
 
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&plaintext);
+    let mut protected = ProtectedKey::empty();
+    protected.as_mut_bytes().copy_from_slice(&plaintext);
     plaintext.zeroize();
 
-    let protected = ProtectedKey::new(key_bytes);
     Ok((protected, keystore.address))
 }

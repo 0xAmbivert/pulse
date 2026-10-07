@@ -8,6 +8,7 @@ pub enum SnipeTrigger {
     BlockReached { target_block: u64 },
     MempoolDetected { owner_tx_hash: String, method: String },
     StateFlipDetected { new_state: bool },
+    BaseFeeUpdated { base_fee_wei: u128 },
 }
 
 pub struct CountdownSniper {

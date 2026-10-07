@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }
 alloy = { version = "2.5.0", features = ["full"] }
-revm = { version = "43.0.3", default-features = false, features = ["std", "c-kzg"] }
 
 # Cryptography & Security
 aes-gcm = "0.10"

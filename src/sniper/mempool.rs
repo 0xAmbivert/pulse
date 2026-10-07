@@ -68,42 +68,43 @@ impl MempoolScanner {
 
             let payload = json!({
                 "jsonrpc": "2.0",
-                "method": "txpool_content",
-                "params": [],
+                "method": "eth_getBlockByNumber",
+                "params": ["pending", true],
                 "id": 1
             });
 
             if let Ok(resp) = client.post(&self.rpc_url).json(&payload).send().await {
                 if let Ok(body) = resp.json::<Value>().await {
-                    if let Some(pending) = body.get("result").and_then(|r| r.get("pending")) {
-                        if let Some(pending_map) = pending.as_object() {
-                            for (sender_addr, nonces_map) in pending_map {
-                                let sender_lower = sender_addr.to_lowercase();
-                                let is_owner_match = self.owner_address.as_ref().map_or(false, |o| *o == sender_lower);
-
-                                if let Some(nonces) = nonces_map.as_object() {
-                                    for (_nonce_key, tx_obj) in nonces {
-                                        let to_addr = tx_obj.get("to").and_then(|t| t.as_str()).unwrap_or("").to_lowercase();
-                                        let input_data = tx_obj.get("input").and_then(|i| i.as_str()).unwrap_or("");
-
-                                        let target_matches = to_addr == self.target_contract;
-                                        let selector_matches = self.matches_selector(input_data);
-
-                                        if (is_owner_match && target_matches) || (target_matches && selector_matches) {
-                                            let hash = tx_obj.get("hash").and_then(|h| h.as_str()).unwrap_or("unknown").to_string();
-                                            info!(
-                                                "Mempool sniper detected matching trigger tx: {} from {} to {}",
-                                                hash, sender_lower, to_addr
-                                            );
-                                            let _ = trigger_tx.send(SnipeTrigger::MempoolDetected {
-                                                owner_tx_hash: hash,
-                                                method: input_data.chars().take(10).collect(),
-                                            }).await;
-                                            return;
-                                        }
-                                    }
-                                }
+                    if let Some(result) = body.get("result") {
+                        if let Some(base_fee_hex) = result.get("baseFeePerGas").and_then(|b| b.as_str()) {
+                            if let Ok(base_fee_wei) = u128::from_str_radix(base_fee_hex.trim_start_matches("0x"), 16) {
+                                let _ = trigger_tx.send(SnipeTrigger::BaseFeeUpdated { base_fee_wei }).await;
                             }
+                        }
+                        if let Some(transactions) = result.get("transactions").and_then(|t| t.as_array()) {
+                        for tx_obj in transactions {
+                            let sender_addr = tx_obj.get("from").and_then(|f| f.as_str()).unwrap_or("").to_lowercase();
+                            let to_addr = tx_obj.get("to").and_then(|t| t.as_str()).unwrap_or("").to_lowercase();
+                            let input_data = tx_obj.get("input").and_then(|i| i.as_str()).unwrap_or("");
+
+                            let is_owner_match = self.owner_address.as_ref().map_or(false, |o| *o == sender_addr);
+                            let target_matches = to_addr == self.target_contract;
+                            let selector_matches = self.matches_selector(input_data);
+
+                            // Strict requirement: Must match owner AND target AND selector to prevent spoofing
+                            if is_owner_match && target_matches && selector_matches {
+                                let hash = tx_obj.get("hash").and_then(|h| h.as_str()).unwrap_or("unknown").to_string();
+                                info!(
+                                    "Mempool sniper detected matching trigger tx: {} from {} to {}",
+                                    hash, sender_addr, to_addr
+                                );
+                                let _ = trigger_tx.send(SnipeTrigger::MempoolDetected {
+                                    owner_tx_hash: hash,
+                                    method: input_data.chars().take(10).collect(),
+                                }).await;
+                                return;
+                            }
+                        }
                         }
                     }
                 }

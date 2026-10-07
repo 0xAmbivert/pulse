@@ -71,9 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("\n--- Generate Wallet ---");
                 let mut pass = rpassword::prompt_password("Enter new master passphrase: ").unwrap_or_default();
                 
-                let mut key_bytes = [0u8; 32];
-                rand::rngs::OsRng.fill_bytes(&mut key_bytes);
-                let key = ProtectedKey::new(key_bytes);
+                let mut key = ProtectedKey::empty();
+                rand::rngs::OsRng.fill_bytes(key.as_mut_bytes());
                 let address = get_address_from_protected(&key)?;
                 
                 std::fs::create_dir_all("./keystores").unwrap_or_default();
@@ -97,12 +96,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     continue;
                 }
                 
-                let mut key_bytes = [0u8; 32];
-                match hex::decode_to_slice(clean_hex, &mut key_bytes) {
+                let mut key = ProtectedKey::empty();
+                match hex::decode_to_slice(clean_hex, key.as_mut_bytes()) {
                     Ok(_) => {
                         let mut pass = rpassword::prompt_password("Enter Master Passphrase to encrypt this key: ").unwrap_or_default();
                         
-                        let key = ProtectedKey::new(key_bytes);
                         let address = get_address_from_protected(&key)?;
                         std::fs::create_dir_all("./keystores").unwrap_or_default();
                         let path = Path::new("./keystores").join(format!("{}.json", address));
@@ -182,8 +180,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             println!("❌ CRITICAL: Keystore address spoofing detected! Derived: {} != Keystore: {}", worker.address, addr);
                             continue;
                         }
+                        if let Some(ep) = rpc_racer.endpoints().first() {
+                            if let Err(e) = worker.nonce_mgr.resync_from_rpc(&ep.url).await {
+                                println!("⚠️ Failed to fetch nonce for {}: {}", addr, e);
+                            }
+                        }
+                        println!("🔓 Unlocked wallet: {} (Nonce: {})", addr, worker.nonce_mgr.current());
                         workers.push(Arc::new(worker));
-                        println!("🔓 Unlocked wallet: {}", addr);
                     }
                 }
                 Err(_) => println!("❌ Failed to decrypt wallet {}. Wrong password?", p.display()),
@@ -200,6 +203,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Setup Terminal UI
+    std::panic::set_hook(Box::new(|info| {
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        let _ = ratatui::crossterm::ExecutableCommand::execute(&mut std::io::stdout(), ratatui::crossterm::terminal::LeaveAlternateScreen);
+        eprintln!("{}", info);
+    }));
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
@@ -273,6 +282,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 5. Network/RPC Checks
     let endpoints = rpc_racer.endpoints();
+    if endpoints.is_empty() {
+        println!("❌ FATAL: No valid RPC endpoints found. Please check config.toml.");
+        return Ok(());
+    }
     state.add_log(format!("🌐 Active RPC Endpoints: {}", endpoints.len()));
 
     // 6. Remote Pre-Flight Simulation
@@ -307,6 +320,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             Some(trigger) = trigger_rx.recv() => {
                 let msg = match trigger {
+                    SnipeTrigger::BaseFeeUpdated { base_fee_wei } => {
+                        state.current_base_fee = crate::gas::wei_to_gwei(base_fee_wei);
+                        continue;
+                    },
                     SnipeTrigger::CountdownReached { target_unix } => format!("🔥 Trigger: Countdown reached {}", target_unix),
                     SnipeTrigger::MempoolDetected { owner_tx_hash, method } => format!("🔥 Trigger: Mempool flip {} via {}", owner_tx_hash, method),
                     SnipeTrigger::StateFlipDetected { new_state } => format!("🔥 Trigger: State flip to {}", new_state),
@@ -316,9 +333,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 // FIRE MINT TRANSACTION ACROSS ALL WALLETS
                 for worker in &workers {
-                    // Extract calldata config
-                    let calldata_hex = config.drop.custom_calldata_hex.clone().unwrap_or_else(|| "0x00".to_string());
-                    let calldata = hex::decode(calldata_hex.trim_start_matches("0x")).unwrap_or_default();
+                    let calldata = if let Some(hex_str) = &config.drop.custom_calldata_hex {
+                        if hex_str.trim() != "" {
+                            hex::decode(hex_str.trim_start_matches("0x")).unwrap_or_default()
+                        } else {
+                            let func_sig = &config.drop.mint_function;
+                            let hash = alloy::primitives::keccak256(func_sig.as_bytes());
+                            let mut data = hash[0..4].to_vec();
+                            if func_sig.contains("uint256") {
+                                let mut amount = vec![0u8; 31];
+                                amount.push(1);
+                                data.extend_from_slice(&amount);
+                            }
+                            data
+                        }
+                    } else {
+                        let func_sig = &config.drop.mint_function;
+                        let hash = alloy::primitives::keccak256(func_sig.as_bytes());
+                        let mut data = hash[0..4].to_vec();
+                        if func_sig.contains("uint256") {
+                            let mut amount = vec![0u8; 31];
+                            amount.push(1);
+                            data.extend_from_slice(&amount);
+                        }
+                        data
+                    };
                     let value = u128::from_str_radix(&config.drop.mint_value_wei, 10).unwrap_or(0);
                     
                     let current_base_fee_wei = crate::gas::gwei_to_wei(state.current_base_fee);
@@ -352,17 +391,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 let tx_clone = raw_tx.clone();
                                 let racer_fallback = rpc_racer_clone.clone();
                                 tokio::spawn(async move {
-                                    let outcomes = mev_clone.send_private_transaction(&tx_clone).await;
-                                    let mut any_success = false;
-                                    for outcome in &outcomes {
-                                        if outcome.success {
-                                            any_success = true;
-                                        }
-                                    }
-                                    if !any_success {
-                                        // Fallback to public RPC if all MEV builders reject the transaction
-                                        let _ = racer_fallback.race_broadcast_raw_tx(&tx_clone).await;
-                                    }
+                                    let _outcomes = mev_clone.send_private_transaction(&tx_clone).await;
+                                    // Removed silent public RPC fallback as per security audit (CRIT-01).
+                                    // If MEV builders reject the transaction, we abort instead of leaking to public mempool.
                                 });
                             } else {
                                 // Broadcast concurrently via public RPC Racer
