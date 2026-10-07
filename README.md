@@ -39,6 +39,29 @@
 
 ---
 
+## 📦 Installation & Setup
+
+### Prerequisites
+You will need **Rust** and **Cargo** installed on your system to compile the bot.
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+### Clone & Build
+```bash
+# 1. Clone the repository
+git clone https://github.com/0xAmbivert/evm-apex-mint-bot.git
+
+# 2. Enter the directory
+cd evm-apex-mint-bot
+
+# 3. Build the highly-optimized release binary
+cargo build --release
+```
+
+---
+
 ## 🛠️ Quick Start Guide
 
 ### 1️⃣ Configure the Beast (`config.toml`)
