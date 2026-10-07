@@ -41,10 +41,37 @@ struct Cli {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
     
-    // Create a default config if it doesn't exist
-    if !cli.config.exists() {
-        let default_config = AppConfig::default();
-        default_config.save_to_file(&cli.config)?;
+    // Interactive Setup Wizard if config doesn't exist
+    if !cli.config.exists() && !cli.generate_wallet {
+        println!("✨ No config file found. Let's set up your bot!");
+        let mut config = AppConfig::default();
+        
+        print!("🔗 Enter Chain ID (e.g., 1 for ETH, 8453 for Base): ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        config.chain.chain_id = input.trim().parse().unwrap_or(1);
+
+        print!("🌐 Enter RPC URL (WebSocket or HTTP): ");
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        config.chain.rpc_urls = vec![input.trim().to_string()];
+
+        print!("🎯 Enter Target NFT Contract Address: ");
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        config.drop.target_contract = input.trim().to_string();
+
+        print!("💰 Enter Max Gas Fee in Gwei (e.g., 50.0): ");
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        config.gas.max_fee_gwei = input.trim().parse().unwrap_or(50.0);
+        
+        config.save_to_file(&cli.config)?;
+        println!("✅ Config saved to {}!\n", cli.config.display());
     }
 
     if cli.generate_wallet {

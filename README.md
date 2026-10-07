@@ -64,75 +64,35 @@ cargo build --release
 
 ## 🛠️ Quick Start Guide
 
-### 1️⃣ Configure the Beast (`config.toml`)
+### 1️⃣ Launch the Interactive Setup Wizard
 
-Before launching, you must define the `config.toml` file in the root directory. Configure it for your battlefield of choice (Ethereum Mainnet, Arbitrum, Base, etc.):
+Forget manually editing TOML files. Simply launch the bot for the first time, and the **Setup Wizard** will guide you through configuring your drop:
 
-```toml
-[chain]
-# The battleground: 1 for ETH Mainnet, 42161 for Arbitrum, 8453 for Base!
-chain_id = 1
-name = "Ethereum Mainnet"
-
-# 🚀 Your premium, high-octane RPC endpoints
-rpc_urls = [
-    "https://eth.llamarpc.com",
-    "https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY",
-]
-
-# 🥷 The Dark Forest (MEV Relays for Ethereum L1 to bypass the mempool)
-# Leave empty `[]` for L2 networks like Base or Arbitrum.
-mev_builder_urls = [
-    "https://relay.flashbots.net",
-    "https://rpc.titanbuilder.xyz",
-    "https://rpc.beaverbuild.org"
-]
-rpc_timeout_ms = 1500
-
-[drop]
-target_contract = "0xYOUR_NFT_CONTRACT_ADDRESS"
-mint_function = "mint(uint256)"
-mint_value_wei = "0"
-
-# 🎯 Example of targeting a precise timestamp launch
-target_timestamp = 1750000000 
-monitor_owner_address = "0xOWNER_ADDRESS"
-flip_function_signatures = ["setPublicSaleActive(bool)", "unpause()"]
-
-[gas]
-# ⛽ Fine-tune these based on the specific chain's gas mechanics
-max_fee_gwei = 50.0
-max_priority_fee_gwei = 3.0
-gas_limit = 150000
-
-# 🏎️ Auto-Speedup Mechanism
-auto_speedup = true
-speedup_threshold_ms = 12000
-speedup_bump_percent = 15
-hard_gas_ceiling_gwei = 150.0
-
-[wallets]
-# 💼 Your loaded weapons
-keystore_paths = ["./keystores/wallet_01.json"]
-
-[alerts]
-# 🔔 Ding! Get notified when you win
-discord_webhook = ""
+```bash
+cargo run --release
 ```
+
+**The wizard will ask you for:**
+* **Chain ID:** (e.g. `1` for ETH, `8453` for Base, `42161` for Arbitrum)
+* **RPC URL:** Your premium endpoint (e.g. Alchemy, QuickNode, local node).
+* **Target Contract:** The address of the NFT contract.
+* **Max Gas Fee:** The maximum Gwei you are willing to pay during a gas war.
+
+*Once answered, it automatically generates the `config.toml` for you!*
 
 ### 2️⃣ Forge a Secure Wallet
 
 Never put raw private keys into plaintext files! Generate a military-grade AES-encrypted keystore directly from the CLI:
 
 ```bash
-cargo run -- --generate-wallet
+cargo run --release -- --generate-wallet
 ```
 1. You will be prompted to set a **Master Passphrase**. 🤫
 2. The bot generates a completely random secure Ethereum wallet and stores it in `./keystores/<address>.json`.
 3. Copy the outputted public address and **fund it** with the native gas token of your target chain! 💸
-4. Update your `config.toml` so the `keystore_paths` array points to your shiny new `.json` file.
+4. The bot automatically detects `.json` files inside the `./keystores` directory on startup.
 
-### 3️⃣ Launch the Bot
+### 3️⃣ Arm the Snipers (Run the Bot)
 
 Once your wallet is funded and config is locked in, wake the bot up:
 
