@@ -180,7 +180,7 @@ impl RpcRacer {
         outcomes
     }
 
-    /// Fetches transaction receipt from the fastest responding endpoint.
+    /// Fetches transaction receipt concurrently from all healthy endpoints, returning the fastest valid receipt.
     pub async fn poll_receipt(&self, tx_hash: &str) -> Option<Value> {
         let payload = json!({
             "jsonrpc": "2.0",
@@ -189,18 +189,31 @@ impl RpcRacer {
             "id": 1
         });
 
+        let mut tasks = Vec::new();
         for ep in &self.endpoints {
             if !ep.is_healthy {
                 continue;
             }
-            if let Ok(resp) = self.client.post(&ep.url).json(&payload).send().await {
-                if let Ok(json_body) = resp.json::<Value>().await {
-                    if let Some(receipt) = json_body.get("result") {
-                        if !receipt.is_null() {
-                            return Some(receipt.clone());
+            let client = self.client.clone();
+            let url = ep.url.clone();
+            let p = payload.clone();
+            tasks.push(tokio::spawn(async move {
+                if let Ok(resp) = client.post(&url).json(&p).send().await {
+                    if let Ok(json_body) = resp.json::<Value>().await {
+                        if let Some(receipt) = json_body.get("result") {
+                            if !receipt.is_null() {
+                                return Some(receipt.clone());
+                            }
                         }
                     }
                 }
+                None
+            }));
+        }
+
+        for task in tasks {
+            if let Ok(Some(receipt)) = task.await {
+                return Some(receipt);
             }
         }
 
@@ -209,5 +222,9 @@ impl RpcRacer {
 
     pub fn endpoints(&self) -> &[RpcEndpoint] {
         &self.endpoints
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 }

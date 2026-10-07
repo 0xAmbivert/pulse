@@ -4,7 +4,6 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use argon2::{
-    password_hash::SaltString,
     Algorithm, Argon2, Params, Version,
 };
 use rand::rngs::OsRng;
@@ -97,17 +96,31 @@ pub fn encrypt_key_to_file(
 
     let serialized = serde_json::to_string_pretty(&keystore)?;
     if let Some(parent) = dest_path.parent() {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(parent)?;
+        }
     }
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(dest_path)?;
-    std::io::Write::write_all(&mut file, serialized.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(dest_path)?;
+        std::io::Write::write_all(&mut file, serialized.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(dest_path, serialized.as_bytes())?;
+    }
 
     Ok(())
 }
@@ -123,6 +136,10 @@ pub fn decrypt_key_from_file(
     let salt_bytes = hex::decode(&keystore.crypto.kdfparams.salt)?;
     let nonce_bytes = hex::decode(&keystore.crypto.nonce)?;
     let ciphertext_bytes = hex::decode(&keystore.crypto.ciphertext)?;
+
+    if nonce_bytes.len() != 12 {
+        return Err(format!("Invalid nonce length: expected 12 bytes, got {}", nonce_bytes.len()).into());
+    }
 
     let params = Params::new(
         keystore.crypto.kdfparams.m_cost,

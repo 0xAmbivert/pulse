@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::info;
 
 pub struct MempoolScanner {
     rpc_url: String,
@@ -87,7 +87,8 @@ impl MempoolScanner {
                             let to_addr = tx_obj.get("to").and_then(|t| t.as_str()).unwrap_or("").to_lowercase();
                             let input_data = tx_obj.get("input").and_then(|i| i.as_str()).unwrap_or("");
 
-                            let is_owner_match = self.owner_address.as_ref().map_or(false, |o| *o == sender_addr);
+                            // If no owner is specified, match any caller; otherwise require matching owner
+                            let is_owner_match = self.owner_address.as_ref().map_or(true, |o| *o == sender_addr);
                             let target_matches = to_addr == self.target_contract;
                             let selector_matches = self.matches_selector(input_data);
 

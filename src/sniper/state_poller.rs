@@ -51,11 +51,13 @@ impl StatePoller {
                 if let Ok(body) = resp.json::<Value>().await {
                     if let Some(result_hex) = body.get("result").and_then(|r| r.as_str()) {
                         let clean = result_hex.trim_start_matches("0x");
-                        // Exactly match a 32-byte (64 hex char) boolean true
-                        if clean == "0000000000000000000000000000000000000000000000000000000000000001" {
-                            info!("StatePoller detected sale is now active on contract: {}", self.target_contract);
-                            let _ = trigger_tx.send(SnipeTrigger::StateFlipDetected { new_state: true }).await;
-                            return;
+                        // Treat any non-zero returned value as active / true
+                        if let Ok(bytes) = hex::decode(clean) {
+                            if bytes.iter().any(|&b| b != 0) {
+                                info!("StatePoller detected sale is now active on contract: {}", self.target_contract);
+                                let _ = trigger_tx.send(SnipeTrigger::StateFlipDetected { new_state: true }).await;
+                                return;
+                            }
                         }
                     }
                 }

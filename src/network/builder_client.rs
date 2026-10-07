@@ -1,8 +1,9 @@
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
+use alloy::primitives::{keccak256, eip191_hash_message};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::signers::Signer;
+use alloy::signers::SignerSync;
 
 #[derive(Debug, Clone)]
 pub struct BuilderOutcome {
@@ -67,19 +68,73 @@ impl MevBuilderClient {
                     }]
                 });
                 let payload_str = serde_json::to_string(&payload).unwrap_or_default();
-                let sig_result = mev_identity.sign_message(payload_str.as_bytes()).await;
-                if let Ok(sig) = sig_result {
-                    let addr_hex = format!("{:#x}", mev_identity.address());
-                    let auth_header = format!("{}:0x{}", addr_hex, hex::encode(sig.as_bytes()));
 
-                    match client.post(&builder_url)
-                        .header("X-Flashbots-Signature", auth_header)
+                // Helper closure to sign payload according to Flashbots / Builder EIP-191 spec
+                let sign_payload = |identity: &PrivateKeySigner, body: &str| -> Option<String> {
+                    let body_hash = keccak256(body.as_bytes());
+                    let eip191_hash = eip191_hash_message(body_hash);
+                    let sig = identity.sign_hash_sync(&eip191_hash).ok()?;
+                    let addr_hex = format!("{:#x}", identity.address());
+                    Some(format!("{}:0x{}", addr_hex, hex::encode(sig.as_bytes())))
+                };
+
+                let auth_header = sign_payload(&mev_identity, &payload_str);
+                if let Some(header_val) = auth_header {
+                    let req = client.post(&builder_url)
+                        .header("X-Flashbots-Signature", header_val)
                         .header("Content-Type", "application/json")
-                        .body(payload_str)
-                        .send().await {
+                        .body(payload_str.clone());
+
+                    match req.send().await {
                         Ok(resp) => {
                             let duration_ms = start.elapsed().as_millis() as u64;
                             if let Ok(body) = resp.json::<Value>().await {
+                                // If builder does not support eth_sendPrivateTransaction (code -32601 e.g. BeaverBuild), fallback to eth_sendRawTransaction
+                                let method_not_found = body.get("error")
+                                    .and_then(|e| e.get("code"))
+                                    .and_then(|c| c.as_i64())
+                                    .map_or(false, |code| code == -32601);
+
+                                if method_not_found {
+                                    let fallback_payload = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": 1,
+                                        "method": "eth_sendRawTransaction",
+                                        "params": [tx_hex]
+                                    });
+                                    let fallback_str = serde_json::to_string(&fallback_payload).unwrap_or_default();
+                                    let fallback_header = sign_payload(&mev_identity, &fallback_str);
+
+                                    let mut fb_req = client.post(&builder_url)
+                                        .header("Content-Type", "application/json")
+                                        .body(fallback_str);
+                                    if let Some(h) = fallback_header {
+                                        fb_req = fb_req.header("X-Flashbots-Signature", h);
+                                    }
+
+                                    if let Ok(fb_resp) = fb_req.send().await {
+                                        if let Ok(fb_body) = fb_resp.json::<Value>().await {
+                                            if let Some(err) = fb_body.get("error") {
+                                                return BuilderOutcome {
+                                                    builder_url,
+                                                    duration_ms: start.elapsed().as_millis() as u64,
+                                                    success: false,
+                                                    response: None,
+                                                    error: Some(err.to_string()),
+                                                };
+                                            } else {
+                                                return BuilderOutcome {
+                                                    builder_url,
+                                                    duration_ms: start.elapsed().as_millis() as u64,
+                                                    success: true,
+                                                    response: fb_body.get("result").map(|r| r.to_string()),
+                                                    error: None,
+                                                };
+                                            }
+                                        }
+                                    }
+                                }
+
                                 if let Some(err) = body.get("error") {
                                     BuilderOutcome {
                                         builder_url,

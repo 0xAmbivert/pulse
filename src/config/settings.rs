@@ -32,6 +32,34 @@ pub struct DropConfig {
     pub flip_function_signatures: Vec<String>,
 }
 
+impl DropConfig {
+    pub fn build_calldata(&self) -> Result<Vec<u8>, String> {
+        if let Some(ref hex_str) = self.custom_calldata_hex {
+            let clean = hex_str.trim().trim_start_matches("0x");
+            if !clean.is_empty() {
+                return hex::decode(clean)
+                    .map_err(|e| format!("Invalid custom calldata hex: {e}"));
+            }
+        }
+
+        let func_sig = self.mint_function.trim();
+        if func_sig.is_empty() {
+            return Err("Mint function signature cannot be empty".to_string());
+        }
+
+        let hash = alloy::primitives::keccak256(func_sig.as_bytes());
+        let mut data = hash[0..4].to_vec();
+
+        if func_sig.contains("uint256") {
+            let mut amount = vec![0u8; 31];
+            amount.push(1);
+            data.extend_from_slice(&amount);
+        }
+
+        Ok(data)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GasConfig {
     pub max_fee_gwei: f64,

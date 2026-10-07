@@ -3,7 +3,6 @@ use crate::wallet::nonce::NonceManager;
 use alloy::consensus::{SignableTransaction, TxEip1559};
 use alloy::eips::eip2718::Encodable2718;
 use alloy::primitives::{Address, Bytes, TxKind, U256};
-use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync;
 use std::str::FromStr;
 use std::sync::Arc;

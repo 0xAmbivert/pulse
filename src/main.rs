@@ -1,34 +1,38 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
-
-mod alerts;
-mod config;
-mod crypto;
-mod gas;
-mod network;
-mod simulation;
-mod sniper;
-mod ui;
-mod wallet;
-
 use clap::Parser;
 use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use rand::RngCore;
 use zeroize::Zeroize;
 
-use crate::config::AppConfig;
-use crate::sniper::SnipeTrigger;
-use crate::ui::{draw_ui, AppEvent, DashboardState, EventHandler};
-use crate::crypto::{ProtectedKey, encrypt_key_to_file, get_address_from_protected};
+use pulse::alerts::AlertDispatcher;
+use pulse::config::AppConfig;
+use pulse::crypto::decrypt_key_from_file;
+use pulse::gas::{gwei_to_wei, wei_to_gwei, GasEngine};
+use pulse::network::{MevBuilderClient, RpcRacer};
+use pulse::simulation::RevmSimulator;
+use pulse::sniper::{CountdownSniper, MempoolScanner, SnipeTrigger, StatePoller};
+use pulse::ui::{draw_ui, run_interactive_menu, AppEvent, DashboardState, EventHandler};
+use pulse::wallet::WalletWorker;
+
+struct SubmittedTx {
+    worker: Arc<WalletWorker>,
+    tx_hash: String,
+    raw_tx: String,
+    nonce: u64,
+    max_fee_wei: u128,
+    priority_fee_wei: u128,
+    calldata: Vec<u8>,
+    value_wei: u128,
+    last_bump: std::time::Instant,
+    bump_count: u32,
+    confirmed: bool,
+}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -41,130 +45,27 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
-    
+
     // Create default config silently if it doesn't exist so load won't fail
     if !cli.config.exists() {
         AppConfig::default().save_to_file(&cli.config)?;
     }
 
-    loop {
-        println!("\n===============================");
-        println!("        🚀 Pulse 🚀          ");
-        println!("===============================");
-        println!("1. 🟢 Start Sniping Engine");
-        println!("2. ➕ Generate New Wallet");
-        println!("3. 📥 Import Private Key");
-        println!("4. ⚙️  Setup / Edit Config");
-        println!("5. ❌ Exit");
-        print!("👉 Choose an option: ");
-        io::stdout().flush()?;
-        
-        let mut choice = String::new();
-        io::stdin().read_line(&mut choice)?;
-        
-        match choice.trim() {
-            "1" => {
-                println!("Booting Sniping Engine...");
-                break;
-            }
-            "2" => {
-                println!("\n--- Generate Wallet ---");
-                let mut pass = rpassword::prompt_password("Enter new master passphrase: ").unwrap_or_default();
-                
-                let mut key = ProtectedKey::empty();
-                rand::rngs::OsRng.fill_bytes(key.as_mut_bytes());
-                let address = get_address_from_protected(&key)?;
-                
-                std::fs::create_dir_all("./keystores").unwrap_or_default();
-                let path = Path::new("./keystores").join(format!("{}.json", address));
-                encrypt_key_to_file(&key, &address, pass.trim(), &path)?;
-                
-                pass.zeroize();
-
-                println!("✅ Successfully generated and encrypted wallet!");
-                println!("Public Address: {}", address);
-                println!("Keystore Path: {}", path.display());
-            }
-            "3" => {
-                println!("\n--- Import Wallet ---");
-                let mut pk_input = rpassword::prompt_password("Paste your raw private key (Hex): ").unwrap_or_default();
-                let clean_hex = pk_input.trim().trim_start_matches("0x");
-                
-                if clean_hex.len() != 64 {
-                    println!("❌ Invalid private key length. Must be 64 hex characters.");
-                    pk_input.zeroize();
-                    continue;
-                }
-                
-                let mut key = ProtectedKey::empty();
-                match hex::decode_to_slice(clean_hex, key.as_mut_bytes()) {
-                    Ok(_) => {
-                        let mut pass = rpassword::prompt_password("Enter Master Passphrase to encrypt this key: ").unwrap_or_default();
-                        
-                        let address = get_address_from_protected(&key)?;
-                        std::fs::create_dir_all("./keystores").unwrap_or_default();
-                        let path = Path::new("./keystores").join(format!("{}.json", address));
-                        encrypt_key_to_file(&key, &address, pass.trim(), &path)?;
-                        
-                        pass.zeroize();
-                        println!("✅ Successfully imported and encrypted wallet!");
-                        println!("Public Address: {}", address);
-                    }
-                    Err(_) => println!("❌ Invalid hex characters in private key."),
-                }
-                
-                // Securely wipe the hex from memory
-                pk_input.zeroize();
-            }
-            "4" => {
-                println!("\n--- Configuration Wizard ---");
-                let mut config = AppConfig::default();
-                
-                print!("🔗 Enter Chain ID (e.g., 1 for ETH, 8453 for Base): ");
-                io::stdout().flush()?;
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                config.chain.chain_id = input.trim().parse().unwrap_or(1);
-
-                print!("🌐 Enter RPC URL (WebSocket or HTTP): ");
-                io::stdout().flush()?;
-                input.clear();
-                io::stdin().read_line(&mut input)?;
-                if !input.trim().is_empty() {
-                    config.chain.rpc_urls = vec![input.trim().to_string()];
-                }
-
-                print!("🎯 Enter Target NFT Contract Address: ");
-                io::stdout().flush()?;
-                input.clear();
-                io::stdin().read_line(&mut input)?;
-                if !input.trim().is_empty() {
-                    config.drop.target_contract = input.trim().to_string();
-                }
-
-                print!("💰 Enter Max Gas Fee in Gwei (e.g., 50.0): ");
-                io::stdout().flush()?;
-                input.clear();
-                io::stdin().read_line(&mut input)?;
-                config.gas.max_fee_gwei = input.trim().parse().unwrap_or(50.0);
-                
-                config.save_to_file(&cli.config)?;
-                println!("✅ Config saved to {}!", cli.config.display());
-            }
-            "5" => {
-                println!("Goodbye!");
-                return Ok(());
-            }
-            _ => println!("❌ Invalid option. Try again."),
-        }
+    if !run_interactive_menu(&cli.config)? {
+        return Ok(());
     }
 
     let config = AppConfig::load_from_file(&cli.config)?;
 
     // Setup Engine Components
-    let rpc_racer = Arc::new(crate::network::RpcRacer::new(&config.chain.rpc_urls, config.chain.rpc_timeout_ms));
-    let _gas_engine = crate::gas::GasEngine::new(config.gas.hard_gas_ceiling_gwei, config.gas.max_priority_fee_gwei, config.gas.speedup_bump_percent);
-    
+    let rpc_racer = Arc::new(RpcRacer::new(&config.chain.rpc_urls, config.chain.rpc_timeout_ms));
+    let gas_engine = GasEngine::new(config.gas.hard_gas_ceiling_gwei, config.gas.max_priority_fee_gwei, config.gas.speedup_bump_percent);
+    let alerts = Arc::new(AlertDispatcher::new(
+        config.alerts.discord_webhook.clone(),
+        config.alerts.telegram_bot_token.clone(),
+        config.alerts.telegram_chat_id.clone(),
+    ));
+
     // Decrypt wallets securely into memory
     let mut password = rpassword::prompt_password("\n🔑 Enter master passphrase to unlock configured wallets: ").unwrap_or_default();
     let password_trim = password.trim();
@@ -173,9 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for path in &config.wallets.keystore_paths {
         let p = Path::new(path);
         if p.exists() {
-            match crate::crypto::decrypt_key_from_file(p, password_trim) {
+            match decrypt_key_from_file(p, password_trim) {
                 Ok((key, addr)) => {
-                    if let Ok(worker) = crate::wallet::WalletWorker::new(key, 0) {
+                    if let Ok(worker) = WalletWorker::new(key, 0) {
                         if worker.address.to_lowercase() != addr.to_lowercase() {
                             println!("❌ CRITICAL: Keystore address spoofing detected! Derived: {} != Keystore: {}", worker.address, addr);
                             continue;
@@ -230,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. Countdown Sniper
     if let Some(target_unix) = config.drop.target_timestamp {
         if target_unix > 0 {
-            let countdown = crate::sniper::CountdownSniper::new(target_unix, 50);
+            let countdown = CountdownSniper::new(target_unix, 50);
             let tx_clone = trigger_tx.clone();
             tokio::spawn(async move {
                 countdown.wait_for_target(tx_clone).await;
@@ -242,15 +143,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 2. Mempool Scanner
     if let Some(owner) = &config.drop.monitor_owner_address {
         if !owner.is_empty() && !config.chain.rpc_urls.is_empty() {
-            let scanner = crate::sniper::MempoolScanner::new(
+            let scanner = MempoolScanner::new(
                 &config.chain.rpc_urls[0],
                 &target_contract,
                 Some(owner.to_string()),
                 &config.drop.flip_function_signatures,
             );
             // Run a quick match check to validate unused `matches_selector` method
-            let _ = scanner.matches_selector("0x12345678"); 
-            
+            let _ = scanner.matches_selector("0x12345678");
+
             let tx_clone = trigger_tx.clone();
             tokio::spawn(async move {
                 scanner.run_scan_loop(tx_clone).await;
@@ -261,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 3. State Poller
     if !config.drop.flip_function_signatures.is_empty() && !config.chain.rpc_urls.is_empty() {
-        let poller = crate::sniper::StatePoller::new(
+        let poller = StatePoller::new(
             &config.chain.rpc_urls[0],
             &target_contract,
             &config.drop.flip_function_signatures[0],
@@ -275,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 4. MEV Builder Client
     let mev_client = if !config.chain.mev_builder_urls.is_empty() {
-        Some(Arc::new(crate::network::MevBuilderClient::new(&config.chain.mev_builder_urls, config.chain.rpc_timeout_ms)))
+        Some(Arc::new(MevBuilderClient::new(&config.chain.mev_builder_urls, config.chain.rpc_timeout_ms)))
     } else {
         None
     };
@@ -289,16 +190,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.add_log(format!("🌐 Active RPC Endpoints: {}", endpoints.len()));
 
     // 6. Remote Pre-Flight Simulation
-    let simulator = crate::simulation::RevmSimulator::new(&endpoints[0].url);
-    let sim_future = simulator.simulate_call(&workers[0].address, &target_contract, &[0u8], 0, 100000);
-    if let Ok(sim_res) = sim_future.await {
+    let sim_calldata = config.drop.build_calldata().unwrap_or_default();
+    let sim_val = u128::from_str_radix(&config.drop.mint_value_wei, 10).unwrap_or(0);
+    let simulator = RevmSimulator::new(&endpoints[0].url);
+    if let Ok(sim_res) = simulator.simulate_call(&workers[0].address, &target_contract, &sim_calldata, sim_val, config.gas.gas_limit).await {
         if !sim_res.success {
-            state.add_log(format!("⚠️ PRE-FLIGHT SIMULATION FAILED: {:?}", sim_res.revert_reason));
+            state.add_log(format!("⚠️ Pre-flight estimateGas reverted (expected if unopen): {:?}", sim_res.revert_reason));
         } else {
             state.add_log(format!("✅ Pre-flight simulation passed ({} gas)", sim_res.gas_used));
         }
     }
 
+    let mut pending_txs: Vec<SubmittedTx> = Vec::new();
+    let mut has_fired = false;
 
     // Main Event Loop
     while state.is_running {
@@ -312,16 +216,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 match event {
                     AppEvent::Input(key) => state.handle_key(key.code),
                     AppEvent::Tick => {
-                        // Periodic async task like checking transaction receipts
-                        let tx_hash_to_check = "0x000000";
-                        let _receipt = rpc_racer_clone.poll_receipt(tx_hash_to_check);
-                    } 
+                        for tx in pending_txs.iter_mut().filter(|t| !t.confirmed) {
+                            if let Some(receipt) = rpc_racer_clone.poll_receipt(&tx.tx_hash).await {
+                                tx.confirmed = true;
+                                let status_ok = receipt.get("status")
+                                    .and_then(|s| s.as_str())
+                                    .map_or(false, |s| s == "0x1" || s == "1");
+                                let block_num = receipt.get("blockNumber").and_then(|b| b.as_str()).unwrap_or("unknown");
+                                let gas_used = receipt.get("gasUsed").and_then(|g| g.as_str()).unwrap_or("unknown");
+
+                                if status_ok {
+                                    state.add_log(format!("🎉 Tx Confirmed! {} (Block: {})", tx.tx_hash, block_num));
+                                    let alerts_c = alerts.clone();
+                                    let msg = format!("Wallet: {}\nTx: {}\nBlock: {}\nGas: {}", tx.worker.address, tx.tx_hash, block_num, gas_used);
+                                    tokio::spawn(async move {
+                                        alerts_c.dispatch_alert("🎯 Mint Confirmed", &msg, true).await;
+                                    });
+                                } else {
+                                    state.add_log(format!("❌ Tx Reverted on-chain: {}", tx.tx_hash));
+                                    let alerts_c = alerts.clone();
+                                    let msg = format!("Wallet: {}\nTx: {}\nReverted in block: {}", tx.worker.address, tx.tx_hash, block_num);
+                                    tokio::spawn(async move {
+                                        alerts_c.dispatch_alert("⚠️ Mint Reverted", &msg, false).await;
+                                    });
+                                }
+                            } else if config.gas.auto_speedup && tx.last_bump.elapsed().as_millis() >= config.gas.speedup_threshold_ms as u128 {
+                                match gas_engine.calculate_speedup_fees(tx.max_fee_wei, tx.priority_fee_wei) {
+                                    Ok((new_max, new_prio)) => {
+                                        match tx.worker.build_and_sign_eip1559(
+                                            config.chain.chain_id,
+                                            &target_contract,
+                                            &tx.calldata,
+                                            tx.value_wei,
+                                            config.gas.gas_limit,
+                                            new_max,
+                                            new_prio,
+                                            Some(tx.nonce),
+                                        ) {
+                                            Ok((new_raw, _)) => {
+                                                let new_bytes = hex::decode(new_raw.trim_start_matches("0x")).unwrap_or_default();
+                                                let new_hash = format!("{:#x}", alloy::primitives::keccak256(&new_bytes));
+                                                tx.tx_hash = new_hash.clone();
+                                                tx.raw_tx = new_raw.clone();
+                                                tx.max_fee_wei = new_max;
+                                                tx.priority_fee_wei = new_prio;
+                                                tx.last_bump = std::time::Instant::now();
+                                                tx.bump_count += 1;
+
+                                                state.add_log(format!("⚡ Speedup #{} for {} (Max: {:.2} Gwei)", tx.bump_count, tx.worker.address, wei_to_gwei(new_max)));
+
+                                                let alerts_c = alerts.clone();
+                                                let addr = tx.worker.address.clone();
+                                                let cnt = tx.bump_count;
+                                                tokio::spawn(async move {
+                                                    alerts_c.dispatch_alert("⚡ Speedup Bumped", &format!("Wallet: {}\nTx: {}\nBump: #{}\nMax: {:.2} Gwei", addr, new_hash, cnt, wei_to_gwei(new_max)), true).await;
+                                                });
+
+                                                if let Some(mev) = &mev_client {
+                                                    let mev_c = mev.clone();
+                                                    let raw_c = new_raw.clone();
+                                                    tokio::spawn(async move {
+                                                        let _ = mev_c.send_private_transaction(&raw_c).await;
+                                                    });
+                                                } else {
+                                                    let racer_c = rpc_racer_clone.clone();
+                                                    let raw_c = new_raw.clone();
+                                                    tokio::spawn(async move {
+                                                        let _ = racer_c.race_broadcast_raw_tx(&raw_c).await;
+                                                    });
+                                                }
+                                            }
+                                            Err(e) => {
+                                                state.add_log(format!("⚠️ Speedup sign error: {}", e));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        state.add_log(format!("⚠️ Speedup ceiling: {}", e));
+                                        tx.last_bump = std::time::Instant::now();
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Some(trigger) = trigger_rx.recv() => {
                 let msg = match trigger {
                     SnipeTrigger::BaseFeeUpdated { base_fee_wei } => {
-                        state.current_base_fee = crate::gas::wei_to_gwei(base_fee_wei);
+                        state.current_base_fee = wei_to_gwei(base_fee_wei);
                         continue;
                     },
                     SnipeTrigger::CountdownReached { target_unix } => format!("🔥 Trigger: Countdown reached {}", target_unix),
@@ -329,49 +312,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     SnipeTrigger::StateFlipDetected { new_state } => format!("🔥 Trigger: State flip to {}", new_state),
                     SnipeTrigger::BlockReached { target_block } => format!("🔥 Trigger: Target block {} reached", target_block),
                 };
+
+                if has_fired {
+                    state.add_log(format!("ℹ️ Ignored secondary trigger: {}", msg));
+                    continue;
+                }
+                has_fired = true;
                 state.add_log(msg.clone());
 
-                // FIRE MINT TRANSACTION ACROSS ALL WALLETS
-                for worker in &workers {
-                    let calldata = if let Some(hex_str) = &config.drop.custom_calldata_hex {
-                        if hex_str.trim() != "" {
-                            hex::decode(hex_str.trim_start_matches("0x")).unwrap_or_default()
-                        } else {
-                            let func_sig = &config.drop.mint_function;
-                            let hash = alloy::primitives::keccak256(func_sig.as_bytes());
-                            let mut data = hash[0..4].to_vec();
-                            if func_sig.contains("uint256") {
-                                let mut amount = vec![0u8; 31];
-                                amount.push(1);
-                                data.extend_from_slice(&amount);
-                            }
-                            data
-                        }
-                    } else {
-                        let func_sig = &config.drop.mint_function;
-                        let hash = alloy::primitives::keccak256(func_sig.as_bytes());
-                        let mut data = hash[0..4].to_vec();
-                        if func_sig.contains("uint256") {
-                            let mut amount = vec![0u8; 31];
-                            amount.push(1);
-                            data.extend_from_slice(&amount);
-                        }
-                        data
-                    };
-                    let value = u128::from_str_radix(&config.drop.mint_value_wei, 10).unwrap_or(0);
-                    
-                    let current_base_fee_wei = crate::gas::gwei_to_wei(state.current_base_fee);
-                    // Use Dynamic Gas Engine to auto-calculate EIP-1559 fees based on current block condition
-                    let (max_fee_wei, max_priority_fee_wei) = match _gas_engine.calculate_dynamic_fees(current_base_fee_wei, None) {
-                        Ok(fees) => fees,
-                        Err(e) => {
-                            state.add_log(format!("⚠️ Gas ceiling reached: {}", e));
-                            // Fallback to static config
-                            (crate::gas::gwei_to_wei(config.gas.max_fee_gwei), crate::gas::gwei_to_wei(config.gas.max_priority_fee_gwei))
-                        }
-                    };
+                let alerts_c = alerts.clone();
+                let desc = msg.clone();
+                tokio::spawn(async move {
+                    alerts_c.dispatch_alert("🚨 Snipe Trigger Fired", &desc, true).await;
+                });
 
-                    // Removed premature nonce increment
+                let calldata = match config.drop.build_calldata() {
+                    Ok(cd) => cd,
+                    Err(e) => {
+                        state.add_log(format!("❌ Calldata error: {}", e));
+                        continue;
+                    }
+                };
+                let value = u128::from_str_radix(&config.drop.mint_value_wei, 10).unwrap_or(0);
+                let current_base_fee_wei = gwei_to_wei(state.current_base_fee);
+                let (max_fee_wei, max_priority_fee_wei) = match gas_engine.calculate_dynamic_fees(current_base_fee_wei, None) {
+                    Ok(fees) => fees,
+                    Err(e) => {
+                        state.add_log(format!("⚠️ Gas ceiling reached: {}", e));
+                        (gwei_to_wei(config.gas.max_fee_gwei), gwei_to_wei(config.gas.max_priority_fee_gwei))
+                    }
+                };
+
+                for worker in &workers {
                     match worker.build_and_sign_eip1559(
                         config.chain.chain_id,
                         &target_contract,
@@ -383,30 +355,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         None,
                     ) {
                         Ok((raw_tx, nonce)) => {
-                            state.add_log(format!("🚀 Signed tx for {} (Nonce: {})", worker.address, nonce));
-                            
-                            // Broadcast via MEV Builder if active
+                            let tx_bytes = hex::decode(raw_tx.trim_start_matches("0x")).unwrap_or_default();
+                            let tx_hash = format!("{:#x}", alloy::primitives::keccak256(&tx_bytes));
+                            state.add_log(format!("🚀 Signed tx for {} (Nonce: {}, Hash: {})", worker.address, nonce, tx_hash));
+
+                            pending_txs.push(SubmittedTx {
+                                worker: worker.clone(),
+                                tx_hash: tx_hash.clone(),
+                                raw_tx: raw_tx.clone(),
+                                nonce,
+                                max_fee_wei,
+                                priority_fee_wei: max_priority_fee_wei,
+                                calldata: calldata.clone(),
+                                value_wei: value,
+                                last_bump: std::time::Instant::now(),
+                                bump_count: 0,
+                                confirmed: false,
+                            });
+
+                            let alerts_c = alerts.clone();
+                            let addr = worker.address.clone();
+                            let h = tx_hash.clone();
+                            tokio::spawn(async move {
+                                alerts_c.dispatch_alert("🚀 Mint Tx Broadcast", &format!("Wallet: {}\nNonce: {}\nTx: {}", addr, nonce, h), true).await;
+                            });
+
                             if let Some(mev) = &mev_client {
                                 let mev_clone = mev.clone();
                                 let tx_clone = raw_tx.clone();
-                                let racer_fallback = rpc_racer_clone.clone();
                                 tokio::spawn(async move {
                                     let _outcomes = mev_clone.send_private_transaction(&tx_clone).await;
-                                    // Removed silent public RPC fallback as per security audit (CRIT-01).
-                                    // If MEV builders reject the transaction, we abort instead of leaking to public mempool.
                                 });
                             } else {
-                                // Broadcast concurrently via public RPC Racer
                                 let racer = rpc_racer_clone.clone();
                                 let raw_tx_clone = raw_tx.clone();
-                                
                                 tokio::spawn(async move {
-                                    let outcomes = racer.race_broadcast_raw_tx(&raw_tx_clone).await;
-                                    for outcome in outcomes {
-                                        if outcome.success {
-                                            // Valid
-                                        }
-                                    }
+                                    let _outcomes = racer.race_broadcast_raw_tx(&raw_tx_clone).await;
                                 });
                             }
                         }

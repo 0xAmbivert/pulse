@@ -1,5 +1,5 @@
 use std::fmt;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 /// A memory-protected container for sensitive cryptographic secrets (e.g. 32-byte private keys).
 /// - Automatically calls `libc::mlock` upon allocation to prevent OS paging/swap leaks.
@@ -47,7 +47,7 @@ impl ProtectedKey {
 
     /// Locks the underlying memory buffer using `libc::mlock` to ensure the OS never writes it to swap.
     fn lock_memory(&mut self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         unsafe {
             let ptr = self.bytes.as_ptr() as *const libc::c_void;
             let len = self.bytes.len();
@@ -75,7 +75,7 @@ impl Drop for ProtectedKey {
     fn drop(&mut self) {
         // Unlock memory before deallocation if it was locked
         if self.is_locked {
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             unsafe {
                 let ptr = self.bytes.as_ptr() as *const libc::c_void;
                 let len = self.bytes.len();

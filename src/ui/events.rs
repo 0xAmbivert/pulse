@@ -1,5 +1,5 @@
-use crossterm::event::{self, Event as CrosstermEvent, KeyEvent};
-use futures::{FutureExt, StreamExt};
+use crossterm::event::{Event as CrosstermEvent, KeyEvent};
+use futures::StreamExt;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
