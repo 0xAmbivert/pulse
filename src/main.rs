@@ -271,19 +271,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    // 5. Revm Simulator (Warmup)
-    let simulator = crate::simulation::RevmSimulator::new();
-    let _sim_result = simulator.simulate_call(&workers[0].address, &target_contract, &[0u8], 0, 100000);
-
-    // 6. Network/RPC Checks
+    // 5. Network/RPC Checks
     let endpoints = rpc_racer.endpoints();
     state.add_log(format!("🌐 Active RPC Endpoints: {}", endpoints.len()));
-    
-    // Verify Gas Engine Dynamic Fees
-    if let Ok((max_fee, max_priority)) = _gas_engine.calculate_dynamic_fees(crate::gas::gwei_to_wei(state.current_base_fee), None) {
-        let _speedup_fees = _gas_engine.calculate_speedup_fees(max_fee, max_priority);
-        let _test_gwei = crate::gas::wei_to_gwei(max_fee);
+
+    // 6. Remote Pre-Flight Simulation
+    let simulator = crate::simulation::RevmSimulator::new(&endpoints[0].url);
+    let sim_future = simulator.simulate_call(&workers[0].address, &target_contract, &[0u8], 0, 100000);
+    if let Ok(sim_res) = sim_future.await {
+        if !sim_res.success {
+            state.add_log(format!("⚠️ PRE-FLIGHT SIMULATION FAILED: {:?}", sim_res.revert_reason));
+        } else {
+            state.add_log(format!("✅ Pre-flight simulation passed ({} gas)", sim_res.gas_used));
+        }
     }
+
 
     // Main Event Loop
     while state.is_running {
@@ -319,8 +321,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let calldata = hex::decode(calldata_hex.trim_start_matches("0x")).unwrap_or_default();
                     let value = u128::from_str_radix(&config.drop.mint_value_wei, 10).unwrap_or(0);
                     
-                    let max_fee_wei = crate::gas::gwei_to_wei(config.gas.max_fee_gwei);
-                    let max_priority_fee_wei = crate::gas::gwei_to_wei(config.gas.max_priority_fee_gwei);
+                    let current_base_fee_wei = crate::gas::gwei_to_wei(state.current_base_fee);
+                    // Use Dynamic Gas Engine to auto-calculate EIP-1559 fees based on current block condition
+                    let (max_fee_wei, max_priority_fee_wei) = match _gas_engine.calculate_dynamic_fees(current_base_fee_wei, None) {
+                        Ok(fees) => fees,
+                        Err(e) => {
+                            state.add_log(format!("⚠️ Gas ceiling reached: {}", e));
+                            // Fallback to static config
+                            (crate::gas::gwei_to_wei(config.gas.max_fee_gwei), crate::gas::gwei_to_wei(config.gas.max_priority_fee_gwei))
+                        }
+                    };
 
                     // Removed premature nonce increment
                     match worker.build_and_sign_eip1559(
