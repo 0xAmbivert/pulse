@@ -73,6 +73,8 @@ impl ProtectedKey {
 
 impl Drop for ProtectedKey {
     fn drop(&mut self) {
+        // Zeroize MUST happen before unlocking memory
+        self.bytes.as_mut().zeroize();
         // Unlock memory before deallocation if it was locked
         if self.is_locked {
             #[cfg(unix)]
@@ -82,8 +84,6 @@ impl Drop for ProtectedKey {
                 let _ = libc::munlock(ptr, len);
             }
         }
-        // Zeroize is explicitly called
-        self.bytes.as_mut().zeroize();
     }
 }
 

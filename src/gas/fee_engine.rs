@@ -83,7 +83,7 @@ impl GasEngine {
 }
 
 pub fn gwei_to_wei(gwei: f64) -> u128 {
-    (gwei * 1_000_000_000.0) as u128
+    (gwei * 1_000_000_000.0).round() as u128
 }
 
 pub fn wei_to_gwei(wei: u128) -> f64 {

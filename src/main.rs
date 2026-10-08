@@ -14,7 +14,7 @@ use pulse::config::AppConfig;
 use pulse::crypto::decrypt_key_from_file;
 use pulse::gas::{gwei_to_wei, wei_to_gwei, GasEngine};
 use pulse::network::{MevBuilderClient, RpcRacer};
-use pulse::simulation::RevmSimulator;
+use pulse::simulation::RpcSimulator;
 use pulse::sniper::{CountdownSniper, MempoolScanner, SnipeTrigger, StatePoller};
 use pulse::ui::{draw_ui, run_interactive_menu, AppEvent, DashboardState, EventHandler};
 use pulse::wallet::WalletWorker;
@@ -66,9 +66,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ));
 
     // Decrypt wallets securely into memory
-    let pass_input = rpassword::prompt_password("\n🔑 Enter master passphrase to unlock configured wallets: ").unwrap_or_default();
+    let pass_input = match rpassword::prompt_password("\n🔑 Enter master passphrase to unlock configured wallets: ") {
+        Ok(p) => p,
+        Err(e) => {
+            println!("❌ Failed to read passphrase: {}", e);
+            return Ok(());
+        }
+    };
     let password = zeroize::Zeroizing::new(pass_input);
     let password_trim = password.as_str().trim();
+    if password_trim.is_empty() {
+        println!("❌ Empty passphrase rejected.");
+        return Ok(());
+    }
 
     let mut workers = Vec::new();
     for path in &config.wallets.keystore_paths {
@@ -199,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 6. Remote Pre-Flight Simulation
     let sim_calldata = config.drop.build_calldata().unwrap_or_default();
     let sim_val = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
-    let simulator = RevmSimulator::new(&endpoints[0].url);
+    let simulator = RpcSimulator::new(&endpoints[0].url);
     if let Ok(sim_res) = simulator.simulate_call(&workers[0].address, &target_contract, &sim_calldata, sim_val, config.gas.gas_limit).await {
         if !sim_res.success {
             state.add_log(format!("⚠️ Pre-flight estimateGas reverted (expected if unopen): {:?}", sim_res.revert_reason));
@@ -364,7 +374,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 };
 
-                let simulator = RevmSimulator::new(&endpoints[0].url);
+                let simulator = RpcSimulator::new(&endpoints[0].url);
                 if let Ok(sim_res) = simulator.simulate_call(&workers[0].address, &target_contract, &calldata, value, config.gas.gas_limit).await {
                     if !sim_res.success {
                         state.add_log(format!("⛔ JIT Simulation failed, aborting: {:?}", sim_res.revert_reason));

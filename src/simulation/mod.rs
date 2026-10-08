@@ -1,3 +1,3 @@
-pub mod revm_runner;
+pub mod rpc_simulator;
 
-pub use revm_runner::{RevmSimulator, SimResult};
+pub use rpc_simulator::{RpcSimulator, SimResult};

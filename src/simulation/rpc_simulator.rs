@@ -11,12 +11,12 @@ pub struct SimResult {
     pub revert_reason: Option<String>,
 }
 
-pub struct RevmSimulator {
+pub struct RpcSimulator {
     rpc_url: String,
     client: Client,
 }
 
-impl RevmSimulator {
+impl RpcSimulator {
     pub fn new(rpc_url: &str) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_millis(5000))

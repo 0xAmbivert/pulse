@@ -29,18 +29,23 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
             }
             "2" => {
                 println!("\n--- Generate Wallet ---");
-                let pass_input = rpassword::prompt_password("Enter new master passphrase: ").unwrap_or_default();
-                if pass_input.trim().is_empty() {
-                    println!("❌ Empty passphrase rejected.");
+                let pass_input = match rpassword::prompt_password("Enter new master passphrase (min 10 chars): ") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        println!("❌ Failed to read passphrase: {}", e);
+                        continue;
+                    }
+                };
+                let pass = zeroize::Zeroizing::new(pass_input);
+                if pass.as_str().trim().len() < 10 {
+                    println!("❌ Passphrase must be at least 10 characters.");
                     continue;
                 }
-                let pass = zeroize::Zeroizing::new(pass_input);
 
                 let mut key = ProtectedKey::empty();
                 rand::rngs::OsRng.fill_bytes(key.as_mut_bytes());
                 let address = get_address_from_protected(&key)?;
 
-                std::fs::create_dir_all("./keystores").unwrap_or_default();
                 let path = Path::new("./keystores").join(format!("{}.json", address));
                 encrypt_key_to_file(&key, &address, pass.as_str().trim(), &path)?;
 
@@ -58,7 +63,13 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
             }
             "3" => {
                 println!("\n--- Import Wallet ---");
-                let pk_input = rpassword::prompt_password("Paste your raw private key (Hex): ").unwrap_or_default();
+                let pk_input = match rpassword::prompt_password("Paste your raw private key (Hex): ") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        println!("❌ Failed to read private key: {}", e);
+                        continue;
+                    }
+                };
                 let pk_guard = zeroize::Zeroizing::new(pk_input);
                 let clean_hex = pk_guard.as_str().trim().trim_start_matches("0x");
 
@@ -70,15 +81,20 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
                 let mut key = ProtectedKey::empty();
                 match hex::decode_to_slice(clean_hex, key.as_mut_bytes()) {
                     Ok(_) => {
-                        let pass_input = rpassword::prompt_password("Enter Master Passphrase to encrypt this key: ").unwrap_or_default();
-                        if pass_input.trim().is_empty() {
-                            println!("❌ Empty passphrase rejected.");
+                        let pass_input = match rpassword::prompt_password("Enter Master Passphrase to encrypt this key (min 10 chars): ") {
+                            Ok(p) => p,
+                            Err(e) => {
+                                println!("❌ Failed to read passphrase: {}", e);
+                                continue;
+                            }
+                        };
+                        let pass = zeroize::Zeroizing::new(pass_input);
+                        if pass.as_str().trim().len() < 10 {
+                            println!("❌ Passphrase must be at least 10 characters.");
                             continue;
                         }
-                        let pass = zeroize::Zeroizing::new(pass_input);
 
                         let address = get_address_from_protected(&key)?;
-                        std::fs::create_dir_all("./keystores").unwrap_or_default();
                         let path = Path::new("./keystores").join(format!("{}.json", address));
                         encrypt_key_to_file(&key, &address, pass.as_str().trim(), &path)?;
 

@@ -11,7 +11,6 @@ alloy = { version = "2.5.0", features = ["full"] }
 aes-gcm = "0.10"
 argon2 = "0.5"
 zeroize = { version = "1.8", features = ["derive"] }
-secrecy = { version = "0.8", features = ["serde"] }
 rand = "0.8"
 libc = "0.2"
 hex = "0.4"
@@ -29,7 +28,7 @@ serde_json = "1.0"
 toml = "0.8"
 
 # HTTP, Relays & Logging
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset", "http2"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"

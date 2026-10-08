@@ -21,16 +21,17 @@
 
 ### 🛡️ Hardware-Grade Cryptographic Security
 * **Fort Knox at Rest:** Uses standard-defining `Argon2id` + `AES-256-GCM` encrypted keystores.
-* **Pinned RAM (`mlock`):** Prevents the OS from *ever* writing your private keys to disk or swap partitions.
-* **Poof! (`zeroize`):** Automatic memory scrubbing the exact millisecond the bot terminates.
-* **Blazing Signatures:** Ultra-fast local `secp256k1` signing (~150 µs). *Zero* network latency added for signatures!
+* **Protected RAM:** Keeps cryptographic keys isolated in allocated heap memory.
+* **Poof! (`zeroize`):** Automatic memory scrubbing the exact millisecond the bot terminates safely.
+* **Blazing Signatures:** Fast local `secp256k1` signing. *Zero* network latency added for signatures!
 
 ### 🏎️ Parallel RPC Racing
 * **Multi-Route Broadcasting:** Blasts your signed transaction payload concurrently across multiple WebSocket/HTTP RPCs simultaneously!
 * **Dark Forest Mastery:** Native support for **MEV Block Builder** direct relays (Flashbots, Titan) to bypass the public mempool, stop frontrunners, and guarantee top-of-block inclusion. 🥷
 
-### 🎯 Sub-Millisecond Sniping Engines
-* 🕵️ **Mempool Backrun:** Stalks the pending mempool for the owner's transaction (e.g. `setPublicSaleActive()`) and fires your mint *in the exact same block* right behind it!
+### 🎯 Sniping Engines & Pre-Flight Checks
+* **RPC Simulation:** Automatically executes `eth_estimateGas` remotely to abort honeypots or reverts prior to signing.
+* 🕵️ **Mempool Backrun:** Stalks the pending mempool for the owner's transaction and fires your mint right behind it!
 * ⏱️ **Countdown Burst:** Calculates exact target Unix timestamps and bursts pre-signed transactions with sub-millisecond precision.
 * 🔄 **State Poller:** Hammers contract view functions dynamically on every new block header.
 
@@ -98,7 +99,7 @@ You will be greeted with the Main Menu:
 
 ### 4️⃣ Arm the Snipers
 * **Press 1** to start the engine.
-* Enter your Master Passphrase to securely decrypt the keys back into pinned RAM. 🧠
+* Enter your Master Passphrase to securely decrypt the keys back into memory. 🧠
 * You will instantly drop into the **Live Terminal Dashboard**! 🎛️
 * The Snipers will arm themselves and await the drop trigger. When the condition hits, the bot signs locally and parallel-broadcasts to all configured RPC and MEV endpoints in a fraction of a millisecond! 💥
 
