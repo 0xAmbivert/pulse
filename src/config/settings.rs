@@ -149,13 +149,21 @@ impl AppConfig {
         
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
                 .open(path)?;
+
+            // Explicitly set permissions on existing files just in case
+            if let Ok(metadata) = file.metadata() {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o600);
+                let _ = file.set_permissions(perms);
+            }
+
             std::io::Write::write_all(&mut file, content.as_bytes())?;
         }
         

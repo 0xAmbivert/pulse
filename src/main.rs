@@ -307,8 +307,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                 if let Some(mev) = &mev_client {
                                                     let mev_c = mev.clone();
                                                     let raw_c = new_raw.clone();
+                                                    let alerts_c = alerts.clone();
                                                     tokio::spawn(async move {
-                                                        let _ = mev_c.send_private_transaction(&raw_c).await;
+                                                        let outcomes = mev_c.send_private_transaction(&raw_c).await;
+                                                        if !outcomes.iter().any(|o| o.success) {
+                                                            alerts_c.dispatch_alert("⚠️ All Builders Rejected Speedup", &format!("{:?}", outcomes), false).await;
+                                                        }
                                                     });
                                                 } else {
                                                     let racer_c = rpc_racer_clone.clone();
@@ -375,14 +379,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 };
 
                 let simulator = RpcSimulator::new(&endpoints[0].url);
-                if let Ok(sim_res) = simulator.simulate_call(&workers[0].address, &target_contract, &calldata, value, config.gas.gas_limit).await {
-                    if !sim_res.success {
-                        state.add_log(format!("⛔ JIT Simulation failed, aborting: {:?}", sim_res.revert_reason));
-                        let alerts_c = alerts.clone();
-                        let reason = sim_res.revert_reason.unwrap_or_else(|| "Unknown revert".to_string());
-                        tokio::spawn(async move {
-                            alerts_c.dispatch_alert("⛔ Snipe Aborted", &format!("JIT Simulation reverted: {}", reason), false).await;
-                        });
+                match simulator.simulate_call(&workers[0].address, &target_contract, &calldata, value, config.gas.gas_limit).await {
+                    Ok(sim_res) => {
+                        if !sim_res.success {
+                            state.add_log(format!("⛔ JIT Simulation failed, aborting: {:?}", sim_res.revert_reason));
+                            let alerts_c = alerts.clone();
+                            let reason = sim_res.revert_reason.unwrap_or_else(|| "Unknown revert".to_string());
+                            tokio::spawn(async move {
+                                alerts_c.dispatch_alert("⛔ Snipe Aborted", &format!("JIT Simulation reverted: {}", reason), false).await;
+                            });
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        state.add_log(format!("⛔ JIT Simulation RPC error, aborting: {}", e));
                         continue;
                     }
                 }
