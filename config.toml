@@ -17,9 +17,8 @@ target_contract = "0x0000000000000000000000000000000000000000"
 mint_function = "mint(uint256)"
 mint_value_wei = "0"
 flip_function_signatures = [
-    "setPublicSaleActive(bool)",
-    "flipSaleState()",
-    "unpause()",
+    "isPublicSaleActive()",
+    "saleIsActive()",
 ]
 
 [gas]

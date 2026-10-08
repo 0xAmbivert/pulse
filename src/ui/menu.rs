@@ -1,7 +1,6 @@
 use std::io::{self, Write};
 use std::path::Path;
 use rand::RngCore;
-use zeroize::Zeroize;
 
 use crate::config::AppConfig;
 use crate::crypto::{encrypt_key_to_file, get_address_from_protected, ProtectedKey};
@@ -30,7 +29,12 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
             }
             "2" => {
                 println!("\n--- Generate Wallet ---");
-                let mut pass = rpassword::prompt_password("Enter new master passphrase: ").unwrap_or_default();
+                let pass_input = rpassword::prompt_password("Enter new master passphrase: ").unwrap_or_default();
+                if pass_input.trim().is_empty() {
+                    println!("❌ Empty passphrase rejected.");
+                    continue;
+                }
+                let pass = zeroize::Zeroizing::new(pass_input);
 
                 let mut key = ProtectedKey::empty();
                 rand::rngs::OsRng.fill_bytes(key.as_mut_bytes());
@@ -38,7 +42,7 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
 
                 std::fs::create_dir_all("./keystores").unwrap_or_default();
                 let path = Path::new("./keystores").join(format!("{}.json", address));
-                encrypt_key_to_file(&key, &address, pass.trim(), &path)?;
+                encrypt_key_to_file(&key, &address, pass.as_str().trim(), &path)?;
 
                 if let Ok(mut config) = AppConfig::load_from_file(config_path) {
                     let path_str = path.to_string_lossy().to_string();
@@ -48,30 +52,35 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
                     }
                 }
 
-                pass.zeroize();
                 println!("✅ Successfully generated and encrypted wallet!");
                 println!("Public Address: {}", address);
                 println!("Keystore Path: {}", path.display());
             }
             "3" => {
                 println!("\n--- Import Wallet ---");
-                let mut pk_input = rpassword::prompt_password("Paste your raw private key (Hex): ").unwrap_or_default();
-                let clean_hex = pk_input.trim().trim_start_matches("0x");
+                let pk_input = rpassword::prompt_password("Paste your raw private key (Hex): ").unwrap_or_default();
+                let pk_guard = zeroize::Zeroizing::new(pk_input);
+                let clean_hex = pk_guard.as_str().trim().trim_start_matches("0x");
 
                 if clean_hex.len() != 64 {
                     println!("❌ Invalid private key length. Must be 64 hex characters.");
-                    pk_input.zeroize();
                     continue;
                 }
 
                 let mut key = ProtectedKey::empty();
                 match hex::decode_to_slice(clean_hex, key.as_mut_bytes()) {
                     Ok(_) => {
-                        let mut pass = rpassword::prompt_password("Enter Master Passphrase to encrypt this key: ").unwrap_or_default();
+                        let pass_input = rpassword::prompt_password("Enter Master Passphrase to encrypt this key: ").unwrap_or_default();
+                        if pass_input.trim().is_empty() {
+                            println!("❌ Empty passphrase rejected.");
+                            continue;
+                        }
+                        let pass = zeroize::Zeroizing::new(pass_input);
+
                         let address = get_address_from_protected(&key)?;
                         std::fs::create_dir_all("./keystores").unwrap_or_default();
                         let path = Path::new("./keystores").join(format!("{}.json", address));
-                        encrypt_key_to_file(&key, &address, pass.trim(), &path)?;
+                        encrypt_key_to_file(&key, &address, pass.as_str().trim(), &path)?;
 
                         if let Ok(mut config) = AppConfig::load_from_file(config_path) {
                             let path_str = path.to_string_lossy().to_string();
@@ -81,14 +90,11 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
                             }
                         }
 
-                        pass.zeroize();
                         println!("✅ Successfully imported and encrypted wallet!");
                         println!("Public Address: {}", address);
                     }
                     Err(_) => println!("❌ Invalid hex characters in private key."),
                 }
-
-                pk_input.zeroize();
             }
             "4" => {
                 println!("\n--- Configuration Wizard ---");

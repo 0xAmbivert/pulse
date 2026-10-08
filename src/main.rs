@@ -66,8 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ));
 
     // Decrypt wallets securely into memory
-    let password = rpassword::prompt_password("\n🔑 Enter master passphrase to unlock configured wallets: ").unwrap_or_default();
-    let password_trim = password.trim();
+    let pass_input = rpassword::prompt_password("\n🔑 Enter master passphrase to unlock configured wallets: ").unwrap_or_default();
+    let password = zeroize::Zeroizing::new(pass_input);
+    let password_trim = password.as_str().trim();
 
     let mut workers = Vec::new();
     for path in &config.wallets.keystore_paths {
@@ -210,14 +211,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut pending_txs: Vec<SubmittedTx> = Vec::new();
     let mut has_fired = false;
 
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to bind SIGTERM");
+    #[cfg(unix)]
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).expect("Failed to bind SIGHUP");
+
     // Main Event Loop
     while state.is_running {
         terminal.draw(|f| draw_ui(f, &state))?;
 
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                break; // Break the loop so workers go out of scope and trigger Drop
-            }
+            _ = tokio::signal::ctrl_c() => break,
+            _ = async {
+                #[cfg(unix)]
+                { sigterm.recv().await; }
+                #[cfg(not(unix))]
+                { std::future::pending::<()>().await; }
+            } => break,
+            _ = async {
+                #[cfg(unix)]
+                { sighup.recv().await; }
+                #[cfg(not(unix))]
+                { std::future::pending::<()>().await; }
+            } => break,
             Some(event) = events.next() => {
                 match event {
                     AppEvent::Input(key) => state.handle_key(key.code),
@@ -343,10 +359,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let (max_fee_wei, max_priority_fee_wei) = match gas_engine.calculate_dynamic_fees(current_base_fee_wei, None) {
                     Ok(fees) => fees,
                     Err(e) => {
-                        state.add_log(format!("⚠️ Gas ceiling reached: {}", e));
-                        (gwei_to_wei(config.gas.max_fee_gwei), gwei_to_wei(config.gas.max_priority_fee_gwei))
+                        state.add_log(format!("⛔ Snipe aborted, ceiling breach: {}", e));
+                        continue;
                     }
                 };
+
+                let simulator = RevmSimulator::new(&endpoints[0].url);
+                if let Ok(sim_res) = simulator.simulate_call(&workers[0].address, &target_contract, &calldata, value, config.gas.gas_limit).await {
+                    if !sim_res.success {
+                        state.add_log(format!("⛔ JIT Simulation failed, aborting: {:?}", sim_res.revert_reason));
+                        let alerts_c = alerts.clone();
+                        let reason = sim_res.revert_reason.unwrap_or_else(|| "Unknown revert".to_string());
+                        tokio::spawn(async move {
+                            alerts_c.dispatch_alert("⛔ Snipe Aborted", &format!("JIT Simulation reverted: {}", reason), false).await;
+                        });
+                        continue;
+                    }
+                }
 
                 for worker in &workers {
                     match worker.build_and_sign_eip1559(
@@ -388,8 +417,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             if let Some(mev) = &mev_client {
                                 let mev_clone = mev.clone();
                                 let tx_clone = raw_tx.clone();
+                                let alerts_c = alerts.clone();
                                 tokio::spawn(async move {
-                                    let _outcomes = mev_clone.send_private_transaction(&tx_clone).await;
+                                    let outcomes = mev_clone.send_private_transaction(&tx_clone).await;
+                                    if !outcomes.iter().any(|o| o.success) {
+                                        alerts_c.dispatch_alert("⚠️ All Builders Rejected", &format!("{:?}", outcomes), false).await;
+                                    }
                                 });
                             } else {
                                 let racer = rpc_racer_clone.clone();

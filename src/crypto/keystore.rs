@@ -141,6 +141,10 @@ pub fn decrypt_key_from_file(
         return Err(format!("Invalid nonce length: expected 12 bytes, got {}", nonce_bytes.len()).into());
     }
 
+    if keystore.crypto.kdfparams.m_cost > 1_048_576 || keystore.crypto.kdfparams.t_cost > 10 {
+        return Err("Keystore kdfparams exceed safe limits (potential DoS)".into());
+    }
+
     let params = Params::new(
         keystore.crypto.kdfparams.m_cost,
         keystore.crypto.kdfparams.t_cost,
