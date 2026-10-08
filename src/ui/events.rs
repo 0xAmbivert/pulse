@@ -28,13 +28,10 @@ impl EventHandler {
                         }
                     }
                     Some(Ok(evt)) = reader.next() => {
-                        match evt {
-                            CrosstermEvent::Key(key) => {
-                                if sender.send(AppEvent::Input(key)).await.is_err() {
-                                    break;
-                                }
+                        if let CrosstermEvent::Key(key) = evt {
+                            if sender.send(AppEvent::Input(key)).await.is_err() {
+                                break;
                             }
-                            _ => {}
                         }
                     }
                 }

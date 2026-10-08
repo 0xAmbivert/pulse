@@ -88,7 +88,7 @@ impl MempoolScanner {
                             let input_data = tx_obj.get("input").and_then(|i| i.as_str()).unwrap_or("");
 
                             // If no owner is specified, match any caller; otherwise require matching owner
-                            let is_owner_match = self.owner_address.as_ref().map_or(true, |o| *o == sender_addr);
+                            let is_owner_match = self.owner_address.as_ref().is_none_or(|o| *o == sender_addr);
                             let target_matches = to_addr == self.target_contract;
                             let selector_matches = self.matches_selector(input_data);
 

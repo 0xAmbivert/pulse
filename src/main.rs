@@ -8,7 +8,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use zeroize::Zeroize;
 
 use pulse::alerts::AlertDispatcher;
 use pulse::config::AppConfig;
@@ -67,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ));
 
     // Decrypt wallets securely into memory
-    let mut password = rpassword::prompt_password("\n🔑 Enter master passphrase to unlock configured wallets: ").unwrap_or_default();
+    let password = rpassword::prompt_password("\n🔑 Enter master passphrase to unlock configured wallets: ").unwrap_or_default();
     let password_trim = password.trim();
 
     let mut workers = Vec::new();
@@ -96,7 +95,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("⚠️ Configured keystore not found: {}", path);
         }
     }
-    password.zeroize();
 
     if workers.is_empty() {
         println!("❌ No active wallets loaded. Please generate or import a wallet via the wizard first.");
@@ -199,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 6. Remote Pre-Flight Simulation
     let sim_calldata = config.drop.build_calldata().unwrap_or_default();
-    let sim_val = u128::from_str_radix(&config.drop.mint_value_wei, 10).unwrap_or(0);
+    let sim_val = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
     let simulator = RevmSimulator::new(&endpoints[0].url);
     if let Ok(sim_res) = simulator.simulate_call(&workers[0].address, &target_contract, &sim_calldata, sim_val, config.gas.gas_limit).await {
         if !sim_res.success {
@@ -229,7 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 tx.confirmed = true;
                                 let status_ok = receipt.get("status")
                                     .and_then(|s| s.as_str())
-                                    .map_or(false, |s| s == "0x1" || s == "1");
+                                    .is_some_and(|s| s == "0x1" || s == "1");
                                 let block_num = receipt.get("blockNumber").and_then(|b| b.as_str()).unwrap_or("unknown");
                                 let gas_used = receipt.get("gasUsed").and_then(|g| g.as_str()).unwrap_or("unknown");
 
@@ -318,7 +316,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     SnipeTrigger::CountdownReached { target_unix } => format!("🔥 Trigger: Countdown reached {}", target_unix),
                     SnipeTrigger::MempoolDetected { owner_tx_hash, method } => format!("🔥 Trigger: Mempool flip {} via {}", owner_tx_hash, method),
                     SnipeTrigger::StateFlipDetected { new_state } => format!("🔥 Trigger: State flip to {}", new_state),
-                    SnipeTrigger::BlockReached { target_block } => format!("🔥 Trigger: Target block {} reached", target_block),
                 };
 
                 if has_fired {
@@ -341,7 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         continue;
                     }
                 };
-                let value = u128::from_str_radix(&config.drop.mint_value_wei, 10).unwrap_or(0);
+                let value = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
                 let current_base_fee_wei = gwei_to_wei(state.current_base_fee);
                 let (max_fee_wei, max_priority_fee_wei) = match gas_engine.calculate_dynamic_fees(current_base_fee_wei, None) {
                     Ok(fees) => fees,

@@ -92,8 +92,7 @@ impl MevBuilderClient {
                                 // If builder does not support eth_sendPrivateTransaction (code -32601 e.g. BeaverBuild), fallback to eth_sendRawTransaction
                                 let method_not_found = body.get("error")
                                     .and_then(|e| e.get("code"))
-                                    .and_then(|c| c.as_i64())
-                                    .map_or(false, |code| code == -32601);
+                                    .and_then(|c| c.as_i64()) == Some(-32601);
 
                                 if method_not_found {
                                     let fallback_payload = json!({

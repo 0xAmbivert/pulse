@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 pub struct WalletWorker {
     pub address: String,
-    pub address_alloy: Address,
     pub nonce_mgr: Arc<NonceManager>,
     pub key: ProtectedKey,
 }
@@ -23,7 +22,6 @@ impl WalletWorker {
 
         Ok(Self {
             address: addr_str,
-            address_alloy: addr,
             nonce_mgr,
             key,
         })
@@ -31,6 +29,7 @@ impl WalletWorker {
 
     /// Fast-signs an EIP-1559 transaction locally in <1µs using the memory-pinned key.
     /// Returns the raw hex-encoded signed transaction ready for immediate parallel broadcasting.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_and_sign_eip1559(
         &self,
         chain_id: u64,

@@ -63,12 +63,12 @@ impl GasEngine {
 
         let new_max_fee = prev_max_fee_wei
             .checked_mul(multiplier)
-            .map(|v| (v + 99) / 100) // round up
+            .map(|v| v.div_ceil(100)) // round up
             .ok_or(GasError::Overflow)?;
 
         let new_priority_fee = prev_priority_fee_wei
             .checked_mul(multiplier)
-            .map(|v| (v + 99) / 100) // round up
+            .map(|v| v.div_ceil(100)) // round up
             .ok_or(GasError::Overflow)?;
 
         if new_max_fee > self.max_fee_ceiling_wei {

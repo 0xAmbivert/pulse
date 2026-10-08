@@ -5,7 +5,6 @@ use tracing::info;
 #[derive(Debug, Clone)]
 pub enum SnipeTrigger {
     CountdownReached { target_unix: u64 },
-    BlockReached { target_block: u64 },
     MempoolDetected { owner_tx_hash: String, method: String },
     StateFlipDetected { new_state: bool },
     BaseFeeUpdated { base_fee_wei: u128 },

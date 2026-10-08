@@ -8,7 +8,6 @@ use std::time::Duration;
 pub struct SimResult {
     pub success: bool,
     pub gas_used: u64,
-    pub return_data: Vec<u8>,
     pub revert_reason: Option<String>,
 }
 
@@ -58,7 +57,6 @@ impl RevmSimulator {
             return Ok(SimResult {
                 success: false,
                 gas_used: 0,
-                return_data: vec![],
                 revert_reason: Some(revert_reason.to_string()),
             });
         }
@@ -72,7 +70,6 @@ impl RevmSimulator {
         Ok(SimResult {
             success: true,
             gas_used,
-            return_data: vec![],
             revert_reason: None,
         })
     }

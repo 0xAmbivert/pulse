@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone)]
 pub struct RpcEndpoint {
     pub url: String,
-    pub last_latency_ms: Option<u64>,
     pub is_healthy: bool,
 }
 
@@ -21,7 +20,6 @@ pub struct BroadcastOutcome {
 pub struct RpcRacer {
     client: Client,
     endpoints: Vec<RpcEndpoint>,
-    timeout: Duration,
 }
 
 impl RpcRacer {
@@ -38,7 +36,6 @@ impl RpcRacer {
             .iter()
             .map(|url| RpcEndpoint {
                 url: url.clone(),
-                last_latency_ms: None,
                 is_healthy: true,
             })
             .collect();
@@ -46,7 +43,6 @@ impl RpcRacer {
         Self {
             client,
             endpoints,
-            timeout: Duration::from_millis(timeout_ms),
         }
     }
 
@@ -81,7 +77,6 @@ impl RpcRacer {
             if let Ok(res) = task.await {
                 // Update local status
                 if let Some(ep) = self.endpoints.iter_mut().find(|e| e.url == res.0) {
-                    ep.last_latency_ms = res.1;
                     ep.is_healthy = res.1.is_some();
                 }
                 results.push(res);
@@ -222,9 +217,5 @@ impl RpcRacer {
 
     pub fn endpoints(&self) -> &[RpcEndpoint] {
         &self.endpoints
-    }
-
-    pub fn timeout(&self) -> Duration {
-        self.timeout
     }
 }
