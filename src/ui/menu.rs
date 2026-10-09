@@ -5,17 +5,24 @@ use rand::RngCore;
 use crate::config::AppConfig;
 use crate::crypto::{encrypt_key_to_file, get_address_from_protected, ProtectedKey};
 
-/// Displays the interactive CLI menu and returns `Ok(true)` if user chose to start the engine, or `Ok(false)` to exit.
-pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+pub enum MenuAction {
+    StartKeystore,
+    StartEphemeral(ProtectedKey),
+    Exit,
+}
+
+/// Displays the interactive CLI menu and returns the selected action.
+pub fn run_interactive_menu(config_path: &Path) -> Result<MenuAction, Box<dyn std::error::Error + Send + Sync>> {
     loop {
         println!("\n===============================");
         println!("        🚀 Pulse 🚀          ");
         println!("===============================");
-        println!("1. 🟢 Start Sniping Engine");
-        println!("2. ➕ Generate New Wallet");
-        println!("3. 📥 Import Private Key");
-        println!("4. ⚙️  Setup / Edit Config");
-        println!("5. ❌ Exit");
+        println!("1. 🟢 Start Engine (Saved Keystores)");
+        println!("2. ⚡ Ephemeral RAM Mode (Paste Key, zero disk saves)");
+        println!("3. ➕ Generate Encrypted Keystore");
+        println!("4. 📥 Import to Encrypted Keystore");
+        println!("5. ⚙️  Setup / Edit Config");
+        println!("6. ❌ Exit");
         print!("👉 Choose an option: ");
         io::stdout().flush()?;
 
@@ -24,10 +31,39 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
 
         match choice.trim() {
             "1" => {
-                println!("Booting Sniping Engine...");
-                return Ok(true);
+                println!("Booting Sniping Engine from saved keystores...");
+                return Ok(MenuAction::StartKeystore);
             }
             "2" => {
+                println!("\n--- ⚡ Ephemeral RAM-Only Mode ---");
+                println!("ℹ️ The private key lives strictly in mlock-pinned RAM and is NEVER saved to disk.");
+                let pk_input = match rpassword::prompt_password("Paste raw private key (Hex): ") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        println!("❌ Failed to read private key: {}", e);
+                        continue;
+                    }
+                };
+                let pk_guard = zeroize::Zeroizing::new(pk_input);
+                let clean_hex = pk_guard.as_str().trim().trim_start_matches("0x");
+
+                if clean_hex.len() != 64 {
+                    println!("❌ Invalid private key length. Must be 64 hex characters.");
+                    continue;
+                }
+
+                match ProtectedKey::from_hex(clean_hex) {
+                    Ok(key) => {
+                        println!("🔒 Private key loaded directly into memory buffer (zero disk writes).");
+                        return Ok(MenuAction::StartEphemeral(key));
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to parse private key: {}", e);
+                        continue;
+                    }
+                }
+            }
+            "3" => {
                 println!("\n--- Generate Wallet ---");
                 let pass_input = match rpassword::prompt_password("Enter new master passphrase (min 10 chars): ") {
                     Ok(p) => p,
@@ -61,7 +97,7 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
                 println!("Public Address: {}", address);
                 println!("Keystore Path: {}", path.display());
             }
-            "3" => {
+            "4" => {
                 println!("\n--- Import Wallet ---");
                 let pk_input = match rpassword::prompt_password("Paste your raw private key (Hex): ") {
                     Ok(p) => p,
@@ -112,11 +148,11 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
                     Err(_) => println!("❌ Invalid hex characters in private key."),
                 }
             }
-            "4" => {
+            "5" => {
                 println!("\n--- Configuration Wizard ---");
                 let mut config = AppConfig::default();
 
-                print!("🔗 Enter Chain ID (e.g., 1 for ETH, 8453 for Base): ");
+                print!("🔗 Enter Chain ID (e.g., 1 for ETH, 4663 for Robinhood, 8453 for Base): ");
                 io::stdout().flush()?;
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
@@ -151,9 +187,9 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
                 config.save_to_file(config_path)?;
                 println!("✅ Config saved to {}!", config_path.display());
             }
-            "5" => {
+            "6" => {
                 println!("Goodbye!");
-                return Ok(false);
+                return Ok(MenuAction::Exit);
             }
             _ => println!("❌ Invalid option. Try again."),
         }

@@ -1,28 +1,25 @@
 [chain]
-chain_id = 1
+chain_id = 4663
 name = "Ethereum Mainnet"
-rpc_urls = [
-    "https://ethereum-rpc.publicnode.com",
-    "https://1rpc.io/eth",
-]
+rpc_urls = ["https://robinhood-mainnet.g.alchemy.com/v2/alch_dnp1_GGicKNXi_gJI6rV9"]
 mev_builder_urls = [
     "https://relay.flashbots.net",
     "https://rpc.titanbuilder.xyz",
-    "https://rpc.beaverbuild.org",
 ]
 rpc_timeout_ms = 2000
 
 [drop]
-target_contract = "0x0000000000000000000000000000000000000000"
+target_contract = "0x31647d241c328f46ca3a3d3c9fc1588210a08636"
 mint_function = "mint(uint256)"
 mint_value_wei = "0"
 flip_function_signatures = [
     "isPublicSaleActive()",
+    "publicSaleActive()",
     "saleIsActive()",
 ]
 
 [gas]
-max_fee_gwei = 50.0
+max_fee_gwei = 3.0
 max_priority_fee_gwei = 3.0
 gas_limit = 150000
 auto_speedup = true

@@ -16,7 +16,7 @@ use pulse::gas::{gwei_to_wei, wei_to_gwei, GasEngine};
 use pulse::network::{MevBuilderClient, RpcRacer};
 use pulse::simulation::RpcSimulator;
 use pulse::sniper::{CountdownSniper, MempoolScanner, SnipeTrigger, StatePoller};
-use pulse::ui::{draw_ui, run_interactive_menu, AppEvent, DashboardState, EventHandler};
+use pulse::ui::{draw_ui, run_interactive_menu, AppEvent, DashboardState, EventHandler, MenuAction};
 use pulse::wallet::{spawn_tx_monitor, SubmittedTx, WalletWorker};
 
 #[derive(Clone)]
@@ -92,9 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         AppConfig::default().save_to_file(&cli.config)?;
     }
 
-    if !run_interactive_menu(&cli.config)? {
-        return Ok(());
-    }
+    let menu_action = run_interactive_menu(&cli.config)?;
 
     let config = AppConfig::load_from_file(&cli.config)?;
 
@@ -107,50 +105,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.alerts.telegram_chat_id.clone(),
     ));
 
-    // Decrypt wallets securely into memory
-    let pass_input = match rpassword::prompt_password("\n🔑 Enter master passphrase to unlock configured wallets: ") {
-        Ok(p) => p,
-        Err(e) => {
-            println!("❌ Failed to read passphrase: {}", e);
-            return Ok(());
-        }
-    };
-    let password = zeroize::Zeroizing::new(pass_input);
-    let password_trim = password.as_str().trim();
-    if password_trim.is_empty() {
-        println!("❌ Empty passphrase rejected.");
-        return Ok(());
-    }
-
     let mut workers = Vec::new();
-    for path in &config.wallets.keystore_paths {
-        let p = Path::new(path);
-        if p.exists() {
-            match decrypt_key_from_file(p, password_trim) {
-                Ok((key, addr)) => {
-                    if let Ok(worker) = WalletWorker::new(key, 0) {
-                        if worker.address.to_lowercase() != addr.to_lowercase() {
-                            println!("❌ CRITICAL: Keystore address spoofing detected! Derived: {} != Keystore: {}", worker.address, addr);
-                            continue;
-                        }
-                        if let Some(ep) = rpc_racer.endpoints().first() {
-                            if let Err(e) = worker.nonce_mgr.resync_from_rpc(&ep.url).await {
-                                println!("⚠️ Failed to fetch nonce for {}: {}", addr, e);
+
+    match menu_action {
+        MenuAction::Exit => return Ok(()),
+        MenuAction::StartEphemeral(key) => {
+            let addr = pulse::crypto::get_address_from_protected(&key)?;
+            let worker = WalletWorker::new(key, 0)?;
+            if let Some(ep) = rpc_racer.endpoints().first() {
+                if let Err(e) = worker.nonce_mgr.resync_from_rpc(&ep.url).await {
+                    println!("⚠️ Failed to fetch nonce for {}: {}", addr, e);
+                }
+            }
+            println!("🔓 Loaded ephemeral in-memory wallet: {} (Nonce: {})", addr, worker.nonce_mgr.current());
+            workers.push(Arc::new(worker));
+        }
+        MenuAction::StartKeystore => {
+            // Decrypt wallets securely into memory
+            let pass_input = match rpassword::prompt_password("\n🔑 Enter master passphrase to unlock configured wallets: ") {
+                Ok(p) => p,
+                Err(e) => {
+                    println!("❌ Failed to read passphrase: {}", e);
+                    return Ok(());
+                }
+            };
+            let password = zeroize::Zeroizing::new(pass_input);
+            let password_trim = password.as_str().trim();
+            if password_trim.is_empty() {
+                println!("❌ Empty passphrase rejected.");
+                return Ok(());
+            }
+
+            for path in &config.wallets.keystore_paths {
+                let p = Path::new(path);
+                if p.exists() {
+                    match decrypt_key_from_file(p, password_trim) {
+                        Ok((key, addr)) => {
+                            if let Ok(worker) = WalletWorker::new(key, 0) {
+                                if worker.address.to_lowercase() != addr.to_lowercase() {
+                                    println!("❌ CRITICAL: Keystore address spoofing detected! Derived: {} != Keystore: {}", worker.address, addr);
+                                    continue;
+                                }
+                                if let Some(ep) = rpc_racer.endpoints().first() {
+                                    if let Err(e) = worker.nonce_mgr.resync_from_rpc(&ep.url).await {
+                                        println!("⚠️ Failed to fetch nonce for {}: {}", addr, e);
+                                    }
+                                }
+                                println!("🔓 Unlocked wallet: {} (Nonce: {})", addr, worker.nonce_mgr.current());
+                                workers.push(Arc::new(worker));
                             }
                         }
-                        println!("🔓 Unlocked wallet: {} (Nonce: {})", addr, worker.nonce_mgr.current());
-                        workers.push(Arc::new(worker));
+                        Err(_) => println!("❌ Failed to decrypt wallet {}. Wrong password?", p.display()),
                     }
+                } else {
+                    println!("⚠️ Configured keystore not found: {}", path);
                 }
-                Err(_) => println!("❌ Failed to decrypt wallet {}. Wrong password?", p.display()),
             }
-        } else {
-            println!("⚠️ Configured keystore not found: {}", path);
         }
     }
 
     if workers.is_empty() {
-        println!("❌ No active wallets loaded. Please generate or import a wallet via the wizard first.");
+        println!("❌ No active wallets loaded. Please generate, import, or use ephemeral mode.");
         return Ok(());
     }
 
