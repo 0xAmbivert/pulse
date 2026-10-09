@@ -5,13 +5,12 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use pulse::alerts::AlertDispatcher;
 use pulse::config::AppConfig;
-use pulse::crypto::decrypt_key_from_file;
 use pulse::gas::{gwei_to_wei, wei_to_gwei, GasEngine};
 use pulse::network::{MevBuilderClient, RpcRacer};
 use pulse::simulation::RpcSimulator;
@@ -105,69 +104,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.alerts.telegram_chat_id.clone(),
     ));
 
-    let mut workers = Vec::new();
-
-    match menu_action {
+    let key = match menu_action {
         MenuAction::Exit => return Ok(()),
-        MenuAction::StartEphemeral(key) => {
-            let addr = pulse::crypto::get_address_from_protected(&key)?;
-            let worker = WalletWorker::new(key, 0)?;
-            if let Some(ep) = rpc_racer.endpoints().first() {
-                if let Err(e) = worker.nonce_mgr.resync_from_rpc(&ep.url).await {
-                    println!("⚠️ Failed to fetch nonce for {}: {}", addr, e);
-                }
-            }
-            println!("🔓 Loaded ephemeral in-memory wallet: {} (Nonce: {})", addr, worker.nonce_mgr.current());
-            workers.push(Arc::new(worker));
-        }
-        MenuAction::StartKeystore => {
-            // Decrypt wallets securely into memory
-            let pass_input = match rpassword::prompt_password("\n🔑 Enter master passphrase to unlock configured wallets: ") {
-                Ok(p) => p,
-                Err(e) => {
-                    println!("❌ Failed to read passphrase: {}", e);
-                    return Ok(());
-                }
-            };
-            let password = zeroize::Zeroizing::new(pass_input);
-            let password_trim = password.as_str().trim();
-            if password_trim.is_empty() {
-                println!("❌ Empty passphrase rejected.");
-                return Ok(());
-            }
+        MenuAction::Start(k) => k,
+    };
 
-            for path in &config.wallets.keystore_paths {
-                let p = Path::new(path);
-                if p.exists() {
-                    match decrypt_key_from_file(p, password_trim) {
-                        Ok((key, addr)) => {
-                            if let Ok(worker) = WalletWorker::new(key, 0) {
-                                if worker.address.to_lowercase() != addr.to_lowercase() {
-                                    println!("❌ CRITICAL: Keystore address spoofing detected! Derived: {} != Keystore: {}", worker.address, addr);
-                                    continue;
-                                }
-                                if let Some(ep) = rpc_racer.endpoints().first() {
-                                    if let Err(e) = worker.nonce_mgr.resync_from_rpc(&ep.url).await {
-                                        println!("⚠️ Failed to fetch nonce for {}: {}", addr, e);
-                                    }
-                                }
-                                println!("🔓 Unlocked wallet: {} (Nonce: {})", addr, worker.nonce_mgr.current());
-                                workers.push(Arc::new(worker));
-                            }
-                        }
-                        Err(_) => println!("❌ Failed to decrypt wallet {}. Wrong password?", p.display()),
-                    }
-                } else {
-                    println!("⚠️ Configured keystore not found: {}", path);
-                }
-            }
+    let addr = pulse::crypto::get_address_from_protected(&key)?;
+    let worker = WalletWorker::new(key, 0)?;
+    if let Some(ep) = rpc_racer.endpoints().first() {
+        if let Err(e) = worker.nonce_mgr.resync_from_rpc(&ep.url).await {
+            println!("⚠️ Failed to fetch nonce for {}: {}", addr, e);
         }
     }
-
-    if workers.is_empty() {
-        println!("❌ No active wallets loaded. Please generate, import, or use ephemeral mode.");
-        return Ok(());
-    }
+    println!("🔓 Active RAM wallet initialized: {} (Nonce: {})", addr, worker.nonce_mgr.current());
+    let workers = vec![Arc::new(worker)];
 
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {

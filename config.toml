@@ -27,7 +27,4 @@ speedup_threshold_ms = 12000
 speedup_bump_percent = 15
 hard_gas_ceiling_gwei = 150.0
 
-[wallets]
-keystore_paths = ["./keystores/wallet_01.json"]
-
 [alerts]

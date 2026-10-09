@@ -20,8 +20,8 @@
 ## ✨ Core Superpowers
 
 ### 🛡️ Hardware-Grade Cryptographic Security
-* **Fort Knox at Rest:** Uses standard-defining `Argon2id` + `AES-256-GCM` encrypted keystores.
-* **Protected RAM:** Keeps cryptographic keys isolated in allocated heap memory.
+* **Direct RAM Isolation:** Zero disk persistence. Private keys live solely in `mlock`-pinned physical RAM and never touch disk, swap, or keystore files.
+* **No Passwords Required:** No persistent encrypted files to maintain, decrypt, or brute-force.
 * **Poof! (`zeroize`):** Automatic memory scrubbing the exact millisecond the bot terminates safely.
 * **Blazing Signatures:** Fast local `secp256k1` signing. *Zero* network latency added for signatures!
 
@@ -78,30 +78,23 @@ You will be greeted with the Main Menu:
 ===============================
         🚀 Pulse 🚀          
 ===============================
-1. 🟢 Start Sniping Engine
-2. ➕ Generate New Wallet
-3. 📥 Import Private Key
-4. ⚙️  Setup / Edit Config
-5. ❌ Exit
+1. 🟢 Start Sniping Engine (Direct RAM Key)
+2. ⚙️  Setup / Edit Config
+3. ❌ Exit
 👉 Choose an option: 
 ```
 
-### 2️⃣ Forge or Import a Secure Wallet
-* **Press 2** to let Pulse generate a completely random secure Ethereum wallet. 
-* **Press 3** to securely import your own raw private key.
+### 2️⃣ Configure the Drop
+* **Press 2** to launch the interactive Configuration Wizard.
+* Configure your target Chain ID, RPC URL, NFT Contract Address, and maximum Gas limits.
+* Automatically saves your parameters to `config.toml`.
 
-*You will be prompted to set a **Master Passphrase**. The bot locks your key behind military-grade AES encryption in `./keystores/<address>.json` and zeroes the raw string from RAM immediately.*
-
-### 3️⃣ Configure the Drop
-* **Press 4** to launch the interactive Configuration Wizard.
-* The bot will ask for your target Chain ID, RPC URL, NFT Contract Address, and maximum Gas limits.
-* *Once answered, it automatically generates the `config.toml` for you!*
-
-### 4️⃣ Arm the Snipers
+### 3️⃣ Arm the Snipers (RAM Mode)
 * **Press 1** to start the engine.
-* Enter your Master Passphrase to securely decrypt the keys back into memory. 🧠
+* Paste your raw private key (hidden input via `rpassword`, never echoed or logged).
+* The key is parsed directly into `mlock`-pinned memory and never written to disk.
 * You will instantly drop into the **Live Terminal Dashboard**! 🎛️
-* The Snipers will arm themselves and await the drop trigger. When the condition hits, the bot signs locally and parallel-broadcasts to all configured RPC and MEV endpoints in a fraction of a millisecond! 💥
+* When you press `q` or `Esc`, the key is immediately zeroized and purged from RAM. 🛑
 
 ---
 

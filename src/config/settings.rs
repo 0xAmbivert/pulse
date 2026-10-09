@@ -8,7 +8,6 @@ pub struct AppConfig {
     pub chain: ChainConfig,
     pub drop: DropConfig,
     pub gas: GasConfig,
-    pub wallets: WalletConfig,
     pub alerts: AlertConfig,
 }
 
@@ -130,11 +129,6 @@ pub struct GasConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WalletConfig {
-    pub keystore_paths: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertConfig {
     pub discord_webhook: Option<String>,
     pub telegram_bot_token: Option<String>,
@@ -179,9 +173,6 @@ impl Default for AppConfig {
                 speedup_threshold_ms: 12_000,
                 speedup_bump_percent: 15,
                 hard_gas_ceiling_gwei: 150.0,
-            },
-            wallets: WalletConfig {
-                keystore_paths: vec!["./keystores/wallet_01.json".to_string()],
             },
             alerts: AlertConfig {
                 discord_webhook: None,
