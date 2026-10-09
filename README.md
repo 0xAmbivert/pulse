@@ -3,40 +3,41 @@
 </h1>
 
 <p align="center">
-  <strong>An industry-grade, ultra-low-latency NFT Sniper & Mint Bot engineered in pure Rust. 🦀</strong>
+  <strong>An industry-grade, ultra-low-latency NFT Sniper & Mint Engine engineered in pure Rust. 🦀</strong>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-1.98+-orange.svg?style=flat-square" alt="Rust Version">
   <img src="https://img.shields.io/badge/EVM-Multi--Chain-blue.svg?style=flat-square" alt="EVM Multi-Chain">
-  <img src="https://img.shields.io/badge/Security-Argon2id%2BAES256-brightgreen.svg?style=flat-square" alt="Security">
+  <img src="https://img.shields.io/badge/Security-RAM--Only%20%7C%20mlock%2BZeroize-brightgreen.svg?style=flat-square" alt="Security">
   <img src="https://img.shields.io/badge/UI-Ratatui-purple.svg?style=flat-square" alt="TUI">
 </p>
 
 ---
 
-> 🔥 *Designed specifically for high-concurrency, deterministic execution during ruthless NFT drops and gas wars across **Ethereum L1** and **ALL EVM-compatible networks** (Arbitrum, Optimism, Base, Polygon, BSC, etc.). Win the block, every time.*
+> 🔥 *Designed specifically for high-concurrency, deterministic execution during ruthless NFT drops and gas wars across **Ethereum L1** and **ALL EVM-compatible networks** (Robinhood Chain, Arbitrum, Base, Optimism, Polygon, BSC, etc.). Win the block, every time.*
 
 ## ✨ Core Superpowers
 
-### 🛡️ Hardware-Grade Cryptographic Security
-* **Direct RAM Isolation:** Zero disk persistence. Private keys live solely in `mlock`-pinned physical RAM and never touch disk, swap, or keystore files.
+### 🛡️ Hardware-Grade Cryptographic Security (Zero Disk Persistence)
+* **Direct RAM Isolation:** Zero keystores, zero unencrypted files. Private keys exist solely in `mlock`-pinned physical RAM and never touch disk, swap partitions, or page files.
 * **No Passwords Required:** No persistent encrypted files to maintain, decrypt, or brute-force.
-* **Poof! (`zeroize`):** Automatic memory scrubbing the exact millisecond the bot terminates safely.
-* **Blazing Signatures:** Fast local `secp256k1` signing. *Zero* network latency added for signatures!
+* **Poof! (`zeroize`):** Automatic memory scrubbing the exact millisecond the bot terminates safely or intercepts termination signals (`SIGTERM`, `SIGHUP`, `Ctrl-C`).
+* **Blazing Pre-Signed Bursts:** Transactions are pre-signed in memory ahead of the drop and updated dynamically on base fee changes, enabling true $<1\text{ms}$ socket transmission upon trigger arrival.
 
-### 🏎️ Parallel RPC Racing
-* **Multi-Route Broadcasting:** Blasts your signed transaction payload concurrently across multiple HTTP/HTTPS RPCs simultaneously!
-* **Dark Forest Mastery:** Native support for **MEV Block Builder** direct relays (Flashbots, Titan) to bypass the public mempool, stop frontrunners, and guarantee top-of-block inclusion. 🥷
+### 🏎️ Parallel RPC Racing & Chain-Aware Relays
+* **Multi-Route Racing:** Blasts signed transaction payloads concurrently across multiple HTTP/HTTPS RPC endpoints simultaneously.
+* **Chain-Aware MEV Relaying:** On Ethereum L1, concurrently broadcasts to **MEV Block Builders** (Flashbots, Titan, BeaverBuild) and public RPC racers. On L2 networks (e.g. Robinhood Chain, Base, Arbitrum), automatically routes directly to parallel RPC racers without builder overhead.
+* **Pre-Warmed Sockets & Ping HUD:** Keeps TCP and TLS handshakes warm with background keep-alive pings and renders real-time ping latencies on the dashboard.
 
 ### 🎯 Sniping Engines & Pre-Flight Checks
-* **RPC Simulation & Verification:** Automatically executes remote `eth_estimateGas` pre-flight checks to prevent failed transactions and revert penalties, dynamically handling pending mempool backruns.
-* 🕵️ **Mempool Backrun:** Stalks the pending mempool for the owner's transaction and fires your mint right behind it!
-* ⏱️ **Countdown Burst:** Calculates exact target Unix timestamps and bursts transactions with sub-millisecond zero-latency precision.
-* 🔄 **State Poller:** Hammers contract view functions dynamically on every new block header.
+* **Advisory Pre-Flight Simulation:** Executes remote `eth_estimateGas` checks at boot to verify target contract and calldata validity without deadlocking critical execution loops.
+* 🕵️ **Reactive Mempool Backrun:** Supports both WebSocket event streaming (`eth_subscribe` for `newPendingTransactions`) and HTTP pending block inspection. Stalks the owner's transaction and fires your mint in the exact same block!
+* ⏱️ **Countdown Burst:** Calculates exact target Unix timestamps and bursts pre-signed transactions with sub-millisecond precision.
+* 🔄 **State Poller:** Polls contract view functions (e.g. `isPublicSaleActive()`) to detect instant sale state flips.
 
 ### 🎛️ Terminal Command Center (TUI)
-* A gorgeous, asynchronous Terminal UI built with `ratatui` giving you a real-time HUD of latency pinging, gas tracking, active workers, and transaction events.
+* An asynchronous Terminal UI built with `ratatui` providing a real-time HUD of live RPC latencies, dynamic network base fees, active wallet nonces, and transaction execution logs.
 
 ---
 
@@ -67,10 +68,12 @@ cargo build --release
 
 ### 1️⃣ Launch Pulse
 
-Forget manually typing CLI flags or editing TOML files. Pulse features a seamless interactive **Main Menu Wizard**. Just run:
+Forget manual config editing before every drop. Pulse features an interactive, ephemeral in-memory wizard. Just run:
 
 ```bash
 cargo run --release
+# or run the compiled binary directly:
+./target/release/pulse
 ```
 
 You will be greeted with the Main Menu:
@@ -83,16 +86,27 @@ You will be greeted with the Main Menu:
 👉 Choose an option: 
 ```
 
-### 2️⃣ Arm the Snipers (Direct RAM Mode)
-* **Press 1** to launch the session setup.
-* **Private Key:** Paste your raw private key (hidden input via `rpassword`, never echoed or saved). It is parsed directly into `mlock`-pinned RAM buffer.
-* **Session Parameters:** Enter Target Contract, Mint Function, Value in Wei, Gas limits, and Trigger mode.
-* **Zero Disk Persistence:** Every parameter entered lives strictly in RAM for this active run. When you press `q`, `Esc`, or terminate the process, all memory is zeroized and freed. Nothing is written to disk.
-* On every new run, Pulse starts clean with only public network presets from `config.toml`. 🛑
+### 2️⃣ Ephemeral RAM Setup (Option 1)
+Selecting **Option 1** sets up your session directly in physical RAM:
+1. **Private Key:** Paste your 64-character raw private key (hidden input via `rpassword`, never echoed or saved). It is decoded directly into an `mlock`-pinned memory buffer.
+2. **Target Contract:** Enter the NFT or drop contract address.
+3. **RPC URL:** Press Enter to use the public default from `config.toml`, or enter a custom HTTP/HTTPS/WSS RPC.
+4. **Mint Parameters:** Enter the mint function signature (default `mint(uint256)`), quantity, and optional value in Wei.
+5. **Gas Settings:** Enter max fee ceiling or accept the default.
+6. **Trigger Mode:** Select between:
+   - `a` State Poller (Watches contract state flips)
+   - `b` Countdown Timer (Target Unix timestamp)
+   - `c` Mempool Backrun (Watches owner transaction)
+
+### 3️⃣ Zero-Footprint Anti-Forensics
+* **Zero Disk Persistence:** All keys, addresses, and drop parameters entered during setup live only in RAM for the active process.
+* **On Exit:** Press `q` or `Esc` to quit. Pulse immediately zeroizes the memory buffer and frees allocated resources. Nothing is written to `config.toml` or any disk file.
+* **Fresh Runs:** Pulse always starts clean with only public network presets, requiring fresh in-memory input every session.
 
 ---
 
 ## 🕹️ Operations & TUI Controls
 
-* **Live Telemetry:** The UI updates asynchronously without blocking the main event loop, giving you real-time latency metrics and dynamic log readouts. 
-* **Bail Out:** Press `q` or `Esc` at any time to safely terminate the process. The bot will catch the signal, cleanly lock, and immediately zeroize memory to protect your keys. 🛑
+* **Live Telemetry:** The UI updates asynchronously without blocking the main event loop, giving you real-time latency metrics and dynamic log readouts.
+* **Replace-by-Fee Auto-Speedup:** If an in-flight transaction is not confirmed within the configured threshold, Pulse automatically bumps gas fees, re-signs, and re-broadcasts.
+* **Bail Out:** Press `q` or `Esc` at any time to safely terminate the process. The bot catches the signal, cleanly restores the terminal, and immediately zeroizes memory to protect your keys. 🛑
