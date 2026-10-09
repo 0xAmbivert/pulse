@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use crate::config::AppConfig;
 use crate::crypto::ProtectedKey;
@@ -23,20 +23,32 @@ pub fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction, Box<d
         io::stdout().flush()?;
 
         let mut choice = String::new();
-        io::stdin().read_line(&mut choice)?;
+        if io::stdin().read_line(&mut choice)? == 0 {
+            return Ok(MenuAction::Exit);
+        }
 
         match choice.trim() {
             "1" => {
                 println!("\n--- ⚡ Ephemeral RAM Configuration (Zero Disk Saves) ---");
                 println!("🔒 Everything entered here lives only in RAM for this active session and is wiped on exit.\n");
 
-                // 1. Private Key (RAM only, hidden input via rpassword, mlock pinned)
-                let pk_input = match rpassword::prompt_password("1️⃣  Paste raw private key (Hex): ") {
-                    Ok(p) => p,
-                    Err(e) => {
-                        println!("❌ Failed to read private key: {}", e);
-                        continue;
+                // 1. Private Key (RAM only, hidden input via rpassword when interactive, stdin when piped)
+                let pk_input = if io::stdin().is_terminal() {
+                    match rpassword::prompt_password("1️⃣  Paste raw private key (Hex): ") {
+                        Ok(p) => p,
+                        Err(e) => {
+                            println!("❌ Failed to read private key: {}", e);
+                            continue;
+                        }
                     }
+                } else {
+                    print!("1️⃣  Paste raw private key (Hex): ");
+                    io::stdout().flush()?;
+                    let mut line = String::new();
+                    if io::stdin().read_line(&mut line)? == 0 {
+                        return Ok(MenuAction::Exit);
+                    }
+                    line.trim().to_string()
                 };
                 let pk_guard = zeroize::Zeroizing::new(pk_input);
                 let clean_hex = pk_guard.as_str().trim().trim_start_matches("0x");
