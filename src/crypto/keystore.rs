@@ -186,3 +186,64 @@ pub fn decrypt_key_from_file(
 
     Ok((protected, keystore.address))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_keystore_rejects_corrupted_nonce() {
+        let temp_dir = std::env::temp_dir().join("pulse_keystore_test_nonce");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let key_path = temp_dir.join("bad_nonce.json");
+
+        let bad_json = r#"{
+            "version": 1,
+            "address": "0x1234567890123456789012345678901234567890",
+            "crypto": {
+                "cipher": "aes-256-gcm",
+                "ciphertext": "0011223344",
+                "nonce": "001122",
+                "kdf": "argon2id",
+                "kdfparams": {
+                    "m_cost": 65536,
+                    "t_cost": 3,
+                    "p_cost": 4,
+                    "salt": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+                }
+            }
+        }"#;
+        std::fs::write(&key_path, bad_json).unwrap();
+        let res = decrypt_key_from_file(&key_path, "password");
+        assert!(res.is_err());
+        let _ = std::fs::remove_file(key_path);
+    }
+
+    #[test]
+    fn test_keystore_rejects_dos_mcost() {
+        let temp_dir = std::env::temp_dir().join("pulse_keystore_test_dos");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let key_path = temp_dir.join("dos_mcost.json");
+
+        let bad_json = r#"{
+            "version": 1,
+            "address": "0x1234567890123456789012345678901234567890",
+            "crypto": {
+                "cipher": "aes-256-gcm",
+                "ciphertext": "0011223344",
+                "nonce": "00112233445566778899aabb",
+                "kdf": "argon2id",
+                "kdfparams": {
+                    "m_cost": 2000000,
+                    "t_cost": 3,
+                    "p_cost": 4,
+                    "salt": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+                }
+            }
+        }"#;
+        std::fs::write(&key_path, bad_json).unwrap();
+        let res = decrypt_key_from_file(&key_path, "password");
+        assert!(res.is_err());
+        let _ = std::fs::remove_file(key_path);
+    }
+}

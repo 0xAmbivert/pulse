@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -32,8 +33,31 @@ pub struct DropConfig {
     pub flip_function_signatures: Vec<String>,
 }
 
+impl Default for DropConfig {
+    fn default() -> Self {
+        Self {
+            target_contract: "0x0000000000000000000000000000000000000000".to_string(),
+            mint_function: "mint(uint256)".to_string(),
+            mint_value_wei: "0".to_string(),
+            custom_calldata_hex: None,
+            target_timestamp: None,
+            target_block: None,
+            monitor_owner_address: None,
+            flip_function_signatures: vec![
+                "isPublicSaleActive()".to_string(),
+                "publicSaleActive()".to_string(),
+                "saleIsActive()".to_string(),
+            ],
+        }
+    }
+}
+
 impl DropConfig {
     pub fn build_calldata(&self) -> Result<Vec<u8>, String> {
+        self.build_calldata_for_caller(None)
+    }
+
+    pub fn build_calldata_for_caller(&self, caller: Option<&str>) -> Result<Vec<u8>, String> {
         if let Some(ref hex_str) = self.custom_calldata_hex {
             let clean = hex_str.trim().trim_start_matches("0x");
             if !clean.is_empty() {
@@ -50,10 +74,44 @@ impl DropConfig {
         let hash = alloy::primitives::keccak256(func_sig.as_bytes());
         let mut data = hash[0..4].to_vec();
 
-        if func_sig.contains("uint256") {
-            let mut amount = vec![0u8; 31];
-            amount.push(1);
+        // Parameter-less mints (e.g. mint(), claim(), publicMint())
+        if func_sig.ends_with("()") {
+            return Ok(data);
+        }
+
+        // Recipient mints: mint(address,uint256)
+        if func_sig.contains("address,uint256") {
+            let mut addr_bytes = [0u8; 32];
+            if let Some(c) = caller {
+                if let Ok(addr) = alloy::primitives::Address::from_str(c.trim()) {
+                    addr_bytes[12..32].copy_from_slice(addr.as_slice());
+                }
+            }
+            data.extend_from_slice(&addr_bytes);
+            let mut amount = [0u8; 32];
+            amount[31] = 1;
             data.extend_from_slice(&amount);
+            return Ok(data);
+        }
+
+        // Quantity mints: mint(uint256)
+        if func_sig.contains("uint256") && !func_sig.contains("address") {
+            let mut amount = [0u8; 32];
+            amount[31] = 1;
+            data.extend_from_slice(&amount);
+            return Ok(data);
+        }
+
+        // Address only mints: mint(address)
+        if func_sig.contains("address") && !func_sig.contains("uint256") {
+            let mut addr_bytes = [0u8; 32];
+            if let Some(c) = caller {
+                if let Ok(addr) = alloy::primitives::Address::from_str(c.trim()) {
+                    addr_bytes[12..32].copy_from_slice(addr.as_slice());
+                }
+            }
+            data.extend_from_slice(&addr_bytes);
+            return Ok(data);
         }
 
         Ok(data)
@@ -173,5 +231,43 @@ impl AppConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calldata_builder_parameterless() {
+        let drop = DropConfig {
+            mint_function: "mint()".to_string(),
+            ..Default::default()
+        };
+        let calldata = drop.build_calldata().unwrap();
+        assert_eq!(calldata.len(), 4);
+    }
+
+    #[test]
+    fn test_calldata_builder_uint256() {
+        let drop = DropConfig {
+            mint_function: "mint(uint256)".to_string(),
+            ..Default::default()
+        };
+        let calldata = drop.build_calldata().unwrap();
+        assert_eq!(calldata.len(), 36);
+        assert_eq!(calldata[35], 1);
+    }
+
+    #[test]
+    fn test_calldata_builder_address_uint256() {
+        let drop = DropConfig {
+            mint_function: "mint(address,uint256)".to_string(),
+            ..Default::default()
+        };
+        let caller = "0x1111111111111111111111111111111111111111";
+        let calldata = drop.build_calldata_for_caller(Some(caller)).unwrap();
+        assert_eq!(calldata.len(), 4 + 32 + 32);
+        assert_eq!(calldata[67], 1); // quantity 1 at end of second 32-byte word
     }
 }

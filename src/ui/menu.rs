@@ -122,12 +122,16 @@ pub fn run_interactive_menu(config_path: &Path) -> Result<bool, Box<dyn std::err
                 io::stdin().read_line(&mut input)?;
                 config.chain.chain_id = input.trim().parse().unwrap_or(1);
 
-                print!("🌐 Enter RPC URL (WebSocket or HTTP): ");
+                print!("🌐 Enter RPC URL (HTTP or HTTPS): ");
                 io::stdout().flush()?;
                 input.clear();
                 io::stdin().read_line(&mut input)?;
-                if !input.trim().is_empty() {
-                    config.chain.rpc_urls = vec![input.trim().to_string()];
+                let trimmed = input.trim();
+                if !trimmed.is_empty() {
+                    if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+                        println!("⚠️ Notice: RpcRacer requires HTTP/HTTPS endpoints. Please configure an http:// or https:// URL.");
+                    }
+                    config.chain.rpc_urls = vec![trimmed.to_string()];
                 }
 
                 print!("🎯 Enter Target NFT Contract Address: ");

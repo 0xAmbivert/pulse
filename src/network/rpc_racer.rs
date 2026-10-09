@@ -34,9 +34,15 @@ impl RpcRacer {
 
         let endpoints = urls
             .iter()
-            .map(|url| RpcEndpoint {
-                url: url.clone(),
-                is_healthy: true,
+            .map(|url| {
+                let is_ws = url.starts_with("ws://") || url.starts_with("wss://");
+                if is_ws {
+                    eprintln!("⚠️ WARNING: WebSocket URL detected: {}. RpcRacer requires HTTP/HTTPS endpoints. Marking inactive.", url);
+                }
+                RpcEndpoint {
+                    url: url.clone(),
+                    is_healthy: !is_ws,
+                }
             })
             .collect();
 
@@ -46,11 +52,14 @@ impl RpcRacer {
         }
     }
 
-    /// Pings all configured RPC endpoints concurrently to evaluate response times.
-    pub async fn benchmark_latencies(&mut self) -> Vec<(String, Option<u64>)> {
+    /// Pings all configured RPC endpoints concurrently to evaluate response times and keep connection pools warm.
+    pub async fn benchmark_latencies(&self) -> Vec<(String, Option<u64>)> {
         let mut tasks = Vec::new();
 
         for endpoint in &self.endpoints {
+            if !endpoint.is_healthy {
+                continue;
+            }
             let client = self.client.clone();
             let url = endpoint.url.clone();
             tasks.push(tokio::spawn(async move {
@@ -75,10 +84,6 @@ impl RpcRacer {
         let mut results = Vec::new();
         for task in tasks {
             if let Ok(res) = task.await {
-                // Update local status
-                if let Some(ep) = self.endpoints.iter_mut().find(|e| e.url == res.0) {
-                    ep.is_healthy = res.1.is_some();
-                }
                 results.push(res);
             }
         }
@@ -184,7 +189,8 @@ impl RpcRacer {
             "id": 1
         });
 
-        let mut tasks = Vec::new();
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+        let tasks = FuturesUnordered::new();
         for ep in &self.endpoints {
             if !ep.is_healthy {
                 continue;
@@ -206,12 +212,41 @@ impl RpcRacer {
             }));
         }
 
-        for task in tasks {
-            if let Ok(Some(receipt)) = task.await {
+        let mut stream = tasks;
+        while let Some(res) = stream.next().await {
+            if let Ok(Some(receipt)) = res {
                 return Some(receipt);
             }
         }
 
+        None
+    }
+
+    /// Queries the latest block's baseFeePerGas from healthy endpoints.
+    pub async fn fetch_latest_base_fee(&self) -> Option<u128> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getBlockByNumber",
+            "params": ["latest", false],
+            "id": 1
+        });
+
+        for ep in &self.endpoints {
+            if !ep.is_healthy {
+                continue;
+            }
+            if let Ok(resp) = self.client.post(&ep.url).json(&payload).send().await {
+                if let Ok(json_body) = resp.json::<Value>().await {
+                    if let Some(base_fee_hex) = json_body.get("result")
+                        .and_then(|r| r.get("baseFeePerGas"))
+                        .and_then(|b| b.as_str()) {
+                        if let Ok(base_fee) = u128::from_str_radix(base_fee_hex.trim_start_matches("0x"), 16) {
+                            return Some(base_fee);
+                        }
+                    }
+                }
+            }
+        }
         None
     }
 

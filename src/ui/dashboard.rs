@@ -12,6 +12,7 @@ pub struct DashboardState {
     pub target_contract: String,
     pub recent_logs: Vec<String>,
     pub current_base_fee: f64,
+    pub latency_ms: Option<u64>,
 }
 
 impl DashboardState {
@@ -22,6 +23,7 @@ impl DashboardState {
             target_contract,
             recent_logs: vec!["Bot initialized. Waiting for trigger...".to_string()],
             current_base_fee: 0.0,
+            latency_ms: None,
         }
     }
 
@@ -68,9 +70,10 @@ pub fn draw_ui(f: &mut Frame, state: &DashboardState) {
     f.render_widget(header, chunks[0]);
 
     // Stats
+    let latency_str = state.latency_ms.map_or("N/A".to_string(), |l| format!("{} ms", l));
     let stats_text = format!(
-        " Active Wallets: {}\n Current Base Fee: {:.2} Gwei",
-        state.active_wallets, state.current_base_fee
+        " Active Wallets: {} | Ping Latency: {}\n Current Base Fee: {:.2} Gwei",
+        state.active_wallets, latency_str, state.current_base_fee
     );
     let stats = Paragraph::new(stats_text)
         .style(Style::default().fg(Color::Yellow))

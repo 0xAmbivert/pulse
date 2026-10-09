@@ -191,3 +191,21 @@ impl MevBuilderClient {
         outcomes
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{eip191_hash_message, keccak256};
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::signers::SignerSync;
+
+    #[test]
+    fn test_builder_eip191_signature_verification() {
+        let identity = PrivateKeySigner::random();
+        let payload = r#"{"jsonrpc":"2.0","id":1,"method":"eth_sendPrivateTransaction","params":[]}"#;
+        let body_hash = keccak256(payload.as_bytes());
+        let eip191_hash = eip191_hash_message(body_hash);
+        let sig = identity.sign_hash_sync(&eip191_hash).unwrap();
+        let recovered = sig.recover_address_from_prehash(&eip191_hash).unwrap();
+        assert_eq!(recovered, identity.address());
+    }
+}

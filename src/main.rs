@@ -17,20 +17,62 @@ use pulse::network::{MevBuilderClient, RpcRacer};
 use pulse::simulation::RpcSimulator;
 use pulse::sniper::{CountdownSniper, MempoolScanner, SnipeTrigger, StatePoller};
 use pulse::ui::{draw_ui, run_interactive_menu, AppEvent, DashboardState, EventHandler};
-use pulse::wallet::WalletWorker;
+use pulse::wallet::{spawn_tx_monitor, SubmittedTx, WalletWorker};
 
-struct SubmittedTx {
+#[derive(Clone)]
+struct PreparedSnipe {
     worker: Arc<WalletWorker>,
-    tx_hash: String,
     raw_tx: String,
+    tx_hash: String,
     nonce: u64,
     max_fee_wei: u128,
     priority_fee_wei: u128,
     calldata: Vec<u8>,
     value_wei: u128,
-    last_bump: std::time::Instant,
-    bump_count: u32,
-    confirmed: bool,
+}
+
+fn prepare_snipes(
+    workers: &[Arc<WalletWorker>],
+    config: &AppConfig,
+    target_contract: &str,
+    current_base_fee_wei: u128,
+    gas_engine: &GasEngine,
+) -> Vec<PreparedSnipe> {
+    let mut snipes = Vec::new();
+    let (max_fee_wei, max_priority_fee_wei) = match gas_engine.calculate_dynamic_fees(current_base_fee_wei, None) {
+        Ok(fees) => fees,
+        Err(_) => (gwei_to_wei(config.gas.max_fee_gwei), gwei_to_wei(config.gas.max_priority_fee_gwei)),
+    };
+    let value = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
+
+    for worker in workers {
+        let calldata = config.drop.build_calldata_for_caller(Some(&worker.address)).unwrap_or_default();
+        let nonce = worker.nonce_mgr.current();
+        if let Ok((raw_tx, n)) = worker.build_and_sign_eip1559(
+            config.chain.chain_id,
+            target_contract,
+            &calldata,
+            value,
+            config.gas.gas_limit,
+            max_fee_wei,
+            max_priority_fee_wei,
+            Some(nonce),
+        ) {
+            let tx_bytes = hex::decode(raw_tx.trim_start_matches("0x")).unwrap_or_default();
+            let tx_hash = format!("{:#x}", alloy::primitives::keccak256(&tx_bytes));
+            snipes.push(PreparedSnipe {
+                worker: worker.clone(),
+                raw_tx,
+                tx_hash,
+                nonce: n,
+                max_fee_wei,
+                priority_fee_wei: max_priority_fee_wei,
+                calldata,
+                value_wei: value,
+            });
+        }
+    }
+    snipes
 }
 
 #[derive(Parser)]
@@ -58,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Setup Engine Components
     let rpc_racer = Arc::new(RpcRacer::new(&config.chain.rpc_urls, config.chain.rpc_timeout_ms));
-    let gas_engine = GasEngine::new(config.gas.hard_gas_ceiling_gwei, config.gas.max_priority_fee_gwei, config.gas.speedup_bump_percent);
+    let gas_engine = Arc::new(GasEngine::new(config.gas.hard_gas_ceiling_gwei, config.gas.max_priority_fee_gwei, config.gas.speedup_bump_percent));
     let alerts = Arc::new(AlertDispatcher::new(
         config.alerts.discord_webhook.clone(),
         config.alerts.telegram_bot_token.clone(),
@@ -139,6 +181,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut events = EventHandler::new(250);
     let (trigger_tx, mut trigger_rx) = mpsc::channel::<SnipeTrigger>(10);
+    let (ui_log_tx, mut ui_log_rx) = mpsc::channel::<String>(100);
+
+    // Continuous Live Base Fee Poller: guarantees current_base_fee is updated in real time across all sniping modes
+    let rpc_for_base_fee = rpc_racer.clone();
+    let trigger_tx_base_fee = trigger_tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(1500));
+        loop {
+            interval.tick().await;
+            if let Some(base_fee_wei) = rpc_for_base_fee.fetch_latest_base_fee().await {
+                let _ = trigger_tx_base_fee.send(SnipeTrigger::BaseFeeUpdated { base_fee_wei }).await;
+            }
+        }
+    });
 
     let target_contract = config.drop.target_contract.clone();
     let rpc_racer_clone = rpc_racer.clone();
@@ -192,9 +248,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // 4. MEV Builder Client
-    let mev_client = if !config.chain.mev_builder_urls.is_empty() {
+    // Chain-aware builder routing: Only Ethereum L1 (chain_id == 1, Sepolia 11155111, Goerli 5) support Flashbots/Titan/Beaver
+    let is_l1 = config.chain.chain_id == 1 || config.chain.chain_id == 11155111 || config.chain.chain_id == 5;
+    let mev_client = if is_l1 && !config.chain.mev_builder_urls.is_empty() {
         Some(Arc::new(MevBuilderClient::new(&config.chain.mev_builder_urls, config.chain.rpc_timeout_ms)))
     } else {
+        if !is_l1 && !config.chain.mev_builder_urls.is_empty() {
+            println!("ℹ️ L2 Chain ID {} detected: Bypassing L1 MEV builders, routing exclusively via parallel RPC racer.", config.chain.chain_id);
+        }
         None
     };
 
@@ -206,19 +267,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     state.add_log(format!("🌐 Active RPC Endpoints: {}", endpoints.len()));
 
-    // 6. Remote Pre-Flight Simulation
+    // 6. Advisory Pre-Flight Simulation (Ensures contract & calldata are valid at boot without deadlocking triggers)
     let sim_calldata = config.drop.build_calldata().unwrap_or_default();
     let sim_val = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
     let simulator = RpcSimulator::new(&endpoints[0].url);
     if let Ok(sim_res) = simulator.simulate_call(&workers[0].address, &target_contract, &sim_calldata, sim_val, config.gas.gas_limit).await {
         if !sim_res.success {
-            state.add_log(format!("⚠️ Pre-flight estimateGas reverted (expected if unopen): {:?}", sim_res.revert_reason));
+            state.add_log(format!("⚠️ Advisory pre-flight simulation reverted (expected if drop unopen): {:?}", sim_res.revert_reason));
         } else {
             state.add_log(format!("✅ Pre-flight simulation passed ({} gas)", sim_res.gas_used));
         }
     }
 
-    let mut pending_txs: Vec<SubmittedTx> = Vec::new();
+    // Pre-Sign Transactions ahead of drop for instantaneous, zero-latency burst dispatch
+    let mut prepared_snipes = prepare_snipes(
+        &workers,
+        &config,
+        &target_contract,
+        gwei_to_wei(state.current_base_fee),
+        &gas_engine,
+    );
+    state.add_log(format!("⚡ Pre-signed {} transactions ahead of drop (zero-latency ready)", prepared_snipes.len()));
+
     let mut has_fired = false;
 
     #[cfg(unix)]
@@ -244,103 +314,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 #[cfg(not(unix))]
                 { std::future::pending::<()>().await; }
             } => break,
+            Some(log_msg) = ui_log_rx.recv() => {
+                state.add_log(log_msg);
+            }
             Some(event) = events.next() => {
                 match event {
                     AppEvent::Input(key) => state.handle_key(key.code),
                     AppEvent::Tick => {
-                        for tx in pending_txs.iter_mut().filter(|t| !t.confirmed) {
-                            if let Some(receipt) = rpc_racer_clone.poll_receipt(&tx.tx_hash).await {
-                                tx.confirmed = true;
-                                let status_ok = receipt.get("status")
-                                    .and_then(|s| s.as_str())
-                                    .is_some_and(|s| s == "0x1" || s == "1");
-                                let block_num = receipt.get("blockNumber").and_then(|b| b.as_str()).unwrap_or("unknown");
-                                let gas_used = receipt.get("gasUsed").and_then(|g| g.as_str()).unwrap_or("unknown");
-
-                                if status_ok {
-                                    state.add_log(format!("🎉 Tx Confirmed! {} (Block: {})", tx.tx_hash, block_num));
-                                    let alerts_c = alerts.clone();
-                                    let msg = format!("Wallet: {}\nTx: {}\nBlock: {}\nGas: {}", tx.worker.address, tx.tx_hash, block_num, gas_used);
-                                    tokio::spawn(async move {
-                                        alerts_c.dispatch_alert("🎯 Mint Confirmed", &msg, true).await;
-                                    });
-                                } else {
-                                    state.add_log(format!("❌ Tx Reverted on-chain: {}", tx.tx_hash));
-                                    let alerts_c = alerts.clone();
-                                    let msg = format!("Wallet: {}\nTx: {}\nReverted in block: {}", tx.worker.address, tx.tx_hash, block_num);
-                                    tokio::spawn(async move {
-                                        alerts_c.dispatch_alert("⚠️ Mint Reverted", &msg, false).await;
-                                    });
-                                }
-                            } else if config.gas.auto_speedup && tx.last_bump.elapsed().as_millis() >= config.gas.speedup_threshold_ms as u128 {
-                                match gas_engine.calculate_speedup_fees(tx.max_fee_wei, tx.priority_fee_wei) {
-                                    Ok((new_max, new_prio)) => {
-                                        match tx.worker.build_and_sign_eip1559(
-                                            config.chain.chain_id,
-                                            &target_contract,
-                                            &tx.calldata,
-                                            tx.value_wei,
-                                            config.gas.gas_limit,
-                                            new_max,
-                                            new_prio,
-                                            Some(tx.nonce),
-                                        ) {
-                                            Ok((new_raw, _)) => {
-                                                let new_bytes = hex::decode(new_raw.trim_start_matches("0x")).unwrap_or_default();
-                                                let new_hash = format!("{:#x}", alloy::primitives::keccak256(&new_bytes));
-                                                tx.tx_hash = new_hash.clone();
-                                                tx.raw_tx = new_raw.clone();
-                                                tx.max_fee_wei = new_max;
-                                                tx.priority_fee_wei = new_prio;
-                                                tx.last_bump = std::time::Instant::now();
-                                                tx.bump_count += 1;
-
-                                                state.add_log(format!("⚡ Speedup #{} for {} (Max: {:.2} Gwei)", tx.bump_count, tx.worker.address, wei_to_gwei(new_max)));
-
-                                                let alerts_c = alerts.clone();
-                                                let addr = tx.worker.address.clone();
-                                                let cnt = tx.bump_count;
-                                                tokio::spawn(async move {
-                                                    alerts_c.dispatch_alert("⚡ Speedup Bumped", &format!("Wallet: {}\nTx: {}\nBump: #{}\nMax: {:.2} Gwei", addr, new_hash, cnt, wei_to_gwei(new_max)), true).await;
-                                                });
-
-                                                if let Some(mev) = &mev_client {
-                                                    let mev_c = mev.clone();
-                                                    let raw_c = new_raw.clone();
-                                                    let alerts_c = alerts.clone();
-                                                    tokio::spawn(async move {
-                                                        let outcomes = mev_c.send_private_transaction(&raw_c).await;
-                                                        if !outcomes.iter().any(|o| o.success) {
-                                                            alerts_c.dispatch_alert("⚠️ All Builders Rejected Speedup", &format!("{:?}", outcomes), false).await;
-                                                        }
-                                                    });
-                                                } else {
-                                                    let racer_c = rpc_racer_clone.clone();
-                                                    let raw_c = new_raw.clone();
-                                                    tokio::spawn(async move {
-                                                        let _ = racer_c.race_broadcast_raw_tx(&raw_c).await;
-                                                    });
-                                                }
-                                            }
-                                            Err(e) => {
-                                                state.add_log(format!("⚠️ Speedup sign error: {}", e));
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        state.add_log(format!("⚠️ Speedup ceiling: {}", e));
-                                        tx.last_bump = std::time::Instant::now();
-                                    }
-                                }
-                            }
-                        }
+                        // Keep-alive connection ping & telemetry update
+                        let racer = rpc_racer_clone.clone();
+                        let lats = racer.benchmark_latencies().await;
+                        state.latency_ms = lats.iter().filter_map(|(_, l)| *l).min();
                     }
                 }
             }
             Some(trigger) = trigger_rx.recv() => {
-                let msg = match trigger {
+                let msg = match &trigger {
                     SnipeTrigger::BaseFeeUpdated { base_fee_wei } => {
-                        state.current_base_fee = wei_to_gwei(base_fee_wei);
+                        state.current_base_fee = wei_to_gwei(*base_fee_wei);
+                        if !has_fired {
+                            prepared_snipes = prepare_snipes(&workers, &config, &target_contract, *base_fee_wei, &gas_engine);
+                        }
                         continue;
                     },
                     SnipeTrigger::CountdownReached { target_unix } => format!("🔥 Trigger: Countdown reached {}", target_unix),
@@ -361,101 +355,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     alerts_c.dispatch_alert("🚨 Snipe Trigger Fired", &desc, true).await;
                 });
 
-                let calldata = match config.drop.build_calldata() {
-                    Ok(cd) => cd,
-                    Err(e) => {
-                        state.add_log(format!("❌ Calldata error: {}", e));
-                        continue;
-                    }
-                };
-                let value = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
-                let current_base_fee_wei = gwei_to_wei(state.current_base_fee);
-                let (max_fee_wei, max_priority_fee_wei) = match gas_engine.calculate_dynamic_fees(current_base_fee_wei, None) {
-                    Ok(fees) => fees,
-                    Err(e) => {
-                        state.add_log(format!("⛔ Snipe aborted, ceiling breach: {}", e));
-                        continue;
-                    }
-                };
+                // ZERO-LATENCY DISPATCH: blast pre-signed transactions immediately!
+                for prepared in &prepared_snipes {
+                    state.add_log(format!("🚀 Blasting pre-signed tx for {} (Nonce: {}, Hash: {})", prepared.worker.address, prepared.nonce, prepared.tx_hash));
 
-                let simulator = RpcSimulator::new(&endpoints[0].url);
-                match simulator.simulate_call(&workers[0].address, &target_contract, &calldata, value, config.gas.gas_limit).await {
-                    Ok(sim_res) => {
-                        if !sim_res.success {
-                            state.add_log(format!("⛔ JIT Simulation failed, aborting: {:?}", sim_res.revert_reason));
-                            let alerts_c = alerts.clone();
-                            let reason = sim_res.revert_reason.unwrap_or_else(|| "Unknown revert".to_string());
-                            tokio::spawn(async move {
-                                alerts_c.dispatch_alert("⛔ Snipe Aborted", &format!("JIT Simulation reverted: {}", reason), false).await;
-                            });
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        state.add_log(format!("⛔ JIT Simulation RPC error, aborting: {}", e));
-                        continue;
-                    }
-                }
+                    let submitted = SubmittedTx {
+                        worker: prepared.worker.clone(),
+                        tx_hash: prepared.tx_hash.clone(),
+                        nonce: prepared.nonce,
+                        max_fee_wei: prepared.max_fee_wei,
+                        priority_fee_wei: prepared.priority_fee_wei,
+                        calldata: prepared.calldata.clone(),
+                        value_wei: prepared.value_wei,
+                        last_bump: std::time::Instant::now(),
+                        bump_count: 0,
+                    };
 
-                for worker in &workers {
-                    match worker.build_and_sign_eip1559(
-                        config.chain.chain_id,
-                        &target_contract,
-                        &calldata,
-                        value,
-                        config.gas.gas_limit,
-                        max_fee_wei,
-                        max_priority_fee_wei,
-                        None,
-                    ) {
-                        Ok((raw_tx, nonce)) => {
-                            let tx_bytes = hex::decode(raw_tx.trim_start_matches("0x")).unwrap_or_default();
-                            let tx_hash = format!("{:#x}", alloy::primitives::keccak256(&tx_bytes));
-                            state.add_log(format!("🚀 Signed tx for {} (Nonce: {}, Hash: {})", worker.address, nonce, tx_hash));
+                    let alerts_c = alerts.clone();
+                    let addr = prepared.worker.address.clone();
+                    let h = prepared.tx_hash.clone();
+                    let nonce = prepared.nonce;
+                    tokio::spawn(async move {
+                        alerts_c.dispatch_alert("🚀 Mint Tx Broadcast", &format!("Wallet: {}\nNonce: {}\nTx: {}", addr, nonce, h), true).await;
+                    });
 
-                            pending_txs.push(SubmittedTx {
-                                worker: worker.clone(),
-                                tx_hash: tx_hash.clone(),
-                                raw_tx: raw_tx.clone(),
-                                nonce,
-                                max_fee_wei,
-                                priority_fee_wei: max_priority_fee_wei,
-                                calldata: calldata.clone(),
-                                value_wei: value,
-                                last_bump: std::time::Instant::now(),
-                                bump_count: 0,
-                                confirmed: false,
-                            });
-
-                            let alerts_c = alerts.clone();
-                            let addr = worker.address.clone();
-                            let h = tx_hash.clone();
-                            tokio::spawn(async move {
-                                alerts_c.dispatch_alert("🚀 Mint Tx Broadcast", &format!("Wallet: {}\nNonce: {}\nTx: {}", addr, nonce, h), true).await;
-                            });
-
-                            if let Some(mev) = &mev_client {
-                                let mev_clone = mev.clone();
-                                let tx_clone = raw_tx.clone();
-                                let alerts_c = alerts.clone();
-                                tokio::spawn(async move {
-                                    let outcomes = mev_clone.send_private_transaction(&tx_clone).await;
-                                    if !outcomes.iter().any(|o| o.success) {
-                                        alerts_c.dispatch_alert("⚠️ All Builders Rejected", &format!("{:?}", outcomes), false).await;
-                                    }
-                                });
-                            } else {
-                                let racer = rpc_racer_clone.clone();
-                                let raw_tx_clone = raw_tx.clone();
-                                tokio::spawn(async move {
-                                    let _outcomes = racer.race_broadcast_raw_tx(&raw_tx_clone).await;
-                                });
+                    // Concurrent Dual Broadcasting on L1: transmit to BOTH MEV builders and public RPC endpoints simultaneously!
+                    if let Some(mev) = &mev_client {
+                        let mev_clone = mev.clone();
+                        let tx_clone = prepared.raw_tx.clone();
+                        let alerts_c = alerts.clone();
+                        tokio::spawn(async move {
+                            let outcomes = mev_clone.send_private_transaction(&tx_clone).await;
+                            if !outcomes.iter().any(|o| o.success) {
+                                alerts_c.dispatch_alert("⚠️ All Builders Rejected", &format!("{:?}", outcomes), false).await;
                             }
-                        }
-                        Err(e) => {
-                            state.add_log(format!("❌ Signing failed for {}: {}", worker.address, e));
-                        }
+                        });
+
+                        // Concurrently race public RPC endpoints alongside MEV builders
+                        let racer = rpc_racer_clone.clone();
+                        let raw_tx_clone = prepared.raw_tx.clone();
+                        tokio::spawn(async move {
+                            let _outcomes = racer.race_broadcast_raw_tx(&raw_tx_clone).await;
+                        });
+                    } else {
+                        // On L2 or without builders: race public RPC endpoints
+                        let racer = rpc_racer_clone.clone();
+                        let raw_tx_clone = prepared.raw_tx.clone();
+                        tokio::spawn(async move {
+                            let _outcomes = racer.race_broadcast_raw_tx(&raw_tx_clone).await;
+                        });
                     }
+
+                    // Background monitor for receipt & auto-speedup
+                    spawn_tx_monitor(
+                        submitted,
+                        rpc_racer_clone.clone(),
+                        mev_client.clone(),
+                        alerts.clone(),
+                        gas_engine.clone(),
+                        config.chain.chain_id,
+                        target_contract.clone(),
+                        config.gas.auto_speedup,
+                        config.gas.speedup_threshold_ms,
+                        config.gas.gas_limit,
+                        ui_log_tx.clone(),
+                    );
                 }
             }
         }

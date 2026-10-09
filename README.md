@@ -26,13 +26,13 @@
 * **Blazing Signatures:** Fast local `secp256k1` signing. *Zero* network latency added for signatures!
 
 ### 🏎️ Parallel RPC Racing
-* **Multi-Route Broadcasting:** Blasts your signed transaction payload concurrently across multiple WebSocket/HTTP RPCs simultaneously!
+* **Multi-Route Broadcasting:** Blasts your signed transaction payload concurrently across multiple HTTP/HTTPS RPCs simultaneously!
 * **Dark Forest Mastery:** Native support for **MEV Block Builder** direct relays (Flashbots, Titan) to bypass the public mempool, stop frontrunners, and guarantee top-of-block inclusion. 🥷
 
 ### 🎯 Sniping Engines & Pre-Flight Checks
-* **RPC Simulation:** Automatically executes `eth_estimateGas` remotely to abort honeypots or reverts prior to signing.
+* **RPC Simulation & Verification:** Automatically executes remote `eth_estimateGas` pre-flight checks to prevent failed transactions and revert penalties, dynamically handling pending mempool backruns.
 * 🕵️ **Mempool Backrun:** Stalks the pending mempool for the owner's transaction and fires your mint right behind it!
-* ⏱️ **Countdown Burst:** Calculates exact target Unix timestamps and bursts pre-signed transactions with sub-millisecond precision.
+* ⏱️ **Countdown Burst:** Calculates exact target Unix timestamps and bursts transactions with sub-millisecond zero-latency precision.
 * 🔄 **State Poller:** Hammers contract view functions dynamically on every new block header.
 
 ### 🎛️ Terminal Command Center (TUI)
