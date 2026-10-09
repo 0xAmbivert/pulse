@@ -78,23 +78,17 @@ You will be greeted with the Main Menu:
 ===============================
         🚀 Pulse 🚀          
 ===============================
-1. 🟢 Start Sniping Engine (Direct RAM Key)
-2. ⚙️  Setup / Edit Config
-3. ❌ Exit
+1. 🟢 Start Sniping Engine (Ephemeral RAM Setup)
+2. ❌ Exit
 👉 Choose an option: 
 ```
 
-### 2️⃣ Configure the Drop
-* **Press 2** to launch the interactive Configuration Wizard.
-* Configure your target Chain ID, RPC URL, NFT Contract Address, and maximum Gas limits.
-* Automatically saves your parameters to `config.toml`.
-
-### 3️⃣ Arm the Snipers (RAM Mode)
-* **Press 1** to start the engine.
-* Paste your raw private key (hidden input via `rpassword`, never echoed or logged).
-* The key is parsed directly into `mlock`-pinned memory and never written to disk.
-* You will instantly drop into the **Live Terminal Dashboard**! 🎛️
-* When you press `q` or `Esc`, the key is immediately zeroized and purged from RAM. 🛑
+### 2️⃣ Arm the Snipers (Direct RAM Mode)
+* **Press 1** to launch the session setup.
+* **Private Key:** Paste your raw private key (hidden input via `rpassword`, never echoed or saved). It is parsed directly into `mlock`-pinned RAM buffer.
+* **Session Parameters:** Enter Target Contract, Mint Function, Value in Wei, Gas limits, and Trigger mode.
+* **Zero Disk Persistence:** Every parameter entered lives strictly in RAM for this active run. When you press `q`, `Esc`, or terminate the process, all memory is zeroized and freed. Nothing is written to disk.
+* On every new run, Pulse starts clean with only public network presets from `config.toml`. 🛑
 
 ---
 

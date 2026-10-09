@@ -91,9 +91,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         AppConfig::default().save_to_file(&cli.config)?;
     }
 
-    let menu_action = run_interactive_menu(&cli.config)?;
+    let base_config = AppConfig::load_from_file(&cli.config)?;
 
-    let config = AppConfig::load_from_file(&cli.config)?;
+    let (key, config) = match run_interactive_menu(&base_config)? {
+        MenuAction::Exit => return Ok(()),
+        MenuAction::Start { key, session_config } => (key, *session_config),
+    };
 
     // Setup Engine Components
     let rpc_racer = Arc::new(RpcRacer::new(&config.chain.rpc_urls, config.chain.rpc_timeout_ms));
@@ -103,11 +106,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.alerts.telegram_bot_token.clone(),
         config.alerts.telegram_chat_id.clone(),
     ));
-
-    let key = match menu_action {
-        MenuAction::Exit => return Ok(()),
-        MenuAction::Start(k) => k,
-    };
 
     let addr = pulse::crypto::get_address_from_protected(&key)?;
     let worker = WalletWorker::new(key, 0)?;
