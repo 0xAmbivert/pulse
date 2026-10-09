@@ -82,23 +82,32 @@ You will be greeted with the Main Menu:
         🚀 Pulse 🚀          
 ===============================
 1. 🟢 Start Sniping Engine (Ephemeral RAM Setup)
-2. ❌ Exit
+2. 🔍 Check Mint & Wallet Eligibility (OpenSea / MintGo / Contract)
+3. ❌ Exit
 👉 Choose an option: 
 ```
 
-### 2️⃣ Ephemeral RAM Setup (Option 1)
+### 2️⃣ Check Mint & Wallet Eligibility (Option 2)
+Selecting **Option 2** launches the automated drop intelligence & eligibility auditor:
+* **Contract or OpenSea URL:** Paste any OpenSea collection link (e.g. `https://opensea.io/collection/housecraft`) or 42-char contract address.
+* **Auto-Resolution:** Automatically extracts collection metadata, resolves the underlying contract address, and maps the chain network.
+* **MintGo & SeaDrop Intelligence:** Queries MintGo drop intelligence for mint stages (presale, whitelist, public), start/end times, and prices.
+* **On-Chain Wallet Audit:** Queries on-chain SeaDrop protocol state and contract mint stats against your specific wallet. Simulates execution via `eth_call` and `eth_estimateGas` to confirm if your wallet is eligible to mint right now, how many remaining tokens you can mint, or decodes the exact contract revert reason.
+* **One-Click Load:** Offers to immediately load verified parameters into the RAM sniper engine!
+
+### 3️⃣ Ephemeral RAM Setup (Option 1)
 Selecting **Option 1** sets up your session directly in physical RAM:
 1. **Private Key:** Paste your 64-character raw private key (hidden input via `rpassword`, never echoed or saved). It is decoded directly into an `mlock`-pinned memory buffer.
-2. **Target Contract:** Enter the NFT or drop contract address.
+2. **Target Contract:** Enter the NFT contract address or paste an OpenSea URL (auto-resolved).
 3. **RPC URL:** Press Enter to use the public default from `config.toml`, or enter a custom HTTP/HTTPS/WSS RPC.
-4. **Mint Parameters:** Enter the mint function signature (default `mint(uint256)`), quantity, and optional value in Wei.
+4. **Mint Parameters:** Enter the mint function signature (auto-detected if SeaDrop), quantity, and value in Wei.
 5. **Gas Settings:** Enter max fee ceiling or accept the default.
 6. **Trigger Mode:** Select between:
    - `a` State Poller (Watches contract state flips)
    - `b` Countdown Timer (Target Unix timestamp)
    - `c` Mempool Backrun (Watches owner transaction)
 
-### 3️⃣ Zero-Footprint Anti-Forensics
+### 4️⃣ Zero-Footprint Anti-Forensics
 * **Zero Disk Persistence:** All keys, addresses, and drop parameters entered during setup live only in RAM for the active process.
 * **On Exit:** Press `q` or `Esc` to quit. Pulse immediately zeroizes the memory buffer and frees allocated resources. Nothing is written to `config.toml` or any disk file.
 * **Fresh Runs:** Pulse always starts clean with only public network presets, requiring fresh in-memory input every session.

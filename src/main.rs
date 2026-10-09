@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let base_config = AppConfig::load_from_file(&cli.config)?;
 
-    let (key, config) = match run_interactive_menu(&base_config)? {
+    let (key, config) = match run_interactive_menu(&base_config).await? {
         MenuAction::Exit => return Ok(()),
         MenuAction::Start { key, session_config } => (key, *session_config),
     };

@@ -261,4 +261,14 @@ mod tests {
         assert_eq!(calldata.len(), 4 + 32 + 32);
         assert_eq!(calldata[67], 1); // quantity 1 at end of second 32-byte word
     }
+
+    #[test]
+    fn test_print_seadrop_selectors() {
+        use alloy::primitives::keccak256;
+        println!("getPublicDrop(address): 0x{}", hex::encode(&keccak256("getPublicDrop(address)")[0..4]));
+        println!("getMintStats(address): 0x{}", hex::encode(&keccak256("getMintStats(address)")[0..4]));
+        println!("getAllowedFeeRecipients(address): 0x{}", hex::encode(&keccak256("getAllowedFeeRecipients(address)")[0..4]));
+        println!("getAllowListMerkleRoot(address): 0x{}", hex::encode(&keccak256("getAllowListMerkleRoot(address)")[0..4]));
+        println!("mintPublic(address,address,address,uint256): 0x{}", hex::encode(&keccak256("mintPublic(address,address,address,uint256)")[0..4]));
+    }
 }

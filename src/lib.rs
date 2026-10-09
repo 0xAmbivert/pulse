@@ -1,6 +1,7 @@
 pub mod alerts;
 pub mod config;
 pub mod crypto;
+pub mod eligibility;
 pub mod gas;
 pub mod network;
 pub mod simulation;
