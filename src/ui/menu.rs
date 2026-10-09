@@ -111,12 +111,16 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 };
 
                 // Check on-chain SeaDrop parameters if applicable
+                let mut seadrop_contract = None;
+                let mut seadrop_fee = None;
                 let seadrop_inspector = crate::eligibility::seadrop::SeaDropInspector::new(&rpc_url);
                 if let Some(sd) = seadrop_inspector.fetch_public_drop(&target_addr).await {
                     println!("🌊 Detected SeaDrop protocol drop! Price: {} Wei ({:.6} ETH), Max per wallet: {}", sd.mint_price_wei, sd.mint_price_wei as f64 / 1e18, sd.max_per_wallet);
                     detected_price_wei = Some(sd.mint_price_wei.to_string());
-                    let clean_fee = sd.fee_recipient.as_deref().unwrap_or("0x0000a26b00c1f0df003000390027140000faa719");
+                    let clean_fee = sd.fee_recipient.clone().unwrap_or_else(|| "0x0000a26b00c1f0df003000390027140000faa719".to_string());
                     detected_mint_func = Some(format!("mintPublic(address,address,address,uint256) | Fee: {}", clean_fee));
+                    seadrop_contract = Some(crate::eligibility::seadrop::SEADROP_V1_ADDRESS.to_string());
+                    seadrop_fee = Some(clean_fee);
                 }
 
                 // 4. Mint Function Signature (Optional: Enter for default)
@@ -195,6 +199,8 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 session_config.drop.mint_value_wei = mint_value_wei;
                 session_config.drop.target_timestamp = target_timestamp;
                 session_config.drop.monitor_owner_address = monitor_owner_address;
+                session_config.drop.seadrop_contract = seadrop_contract;
+                session_config.drop.seadrop_fee_recipient = seadrop_fee;
                 session_config.gas.max_fee_gwei = max_gas_fee;
 
                 println!("\n🔒 Session parameters locked into memory buffer. Booting engine...");
@@ -261,6 +267,13 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                                 session_config.chain.rpc_urls = vec![rpc_url];
                                 session_config.drop.target_contract = report.target.contract_address;
                                 session_config.drop.mint_value_wei = report.wallet_status.price_wei.to_string();
+
+                                if report.drop_mechanism.contains("SeaDrop") {
+                                    session_config.drop.seadrop_contract = Some(crate::eligibility::seadrop::SEADROP_V1_ADDRESS.to_string());
+                                    session_config.drop.seadrop_fee_recipient = report.seadrop_config.as_ref().and_then(|s| s.fee_recipient.clone())
+                                        .or(report.target.fee_recipient.clone());
+                                    session_config.drop.mint_function = "mintPublic(address,address,address,uint256)".to_string();
+                                }
 
                                 println!("\n🚀 Loading verified drop into sniper. Booting engine...");
                                 return Ok(MenuAction::Start { key, session_config: Box::new(session_config) });

@@ -30,6 +30,8 @@ pub struct DropConfig {
     pub target_block: Option<u64>,
     pub monitor_owner_address: Option<String>,
     pub flip_function_signatures: Vec<String>,
+    pub seadrop_contract: Option<String>,
+    pub seadrop_fee_recipient: Option<String>,
 }
 
 impl Default for DropConfig {
@@ -47,6 +49,8 @@ impl Default for DropConfig {
                 "publicSaleActive()".to_string(),
                 "saleIsActive()".to_string(),
             ],
+            seadrop_contract: None,
+            seadrop_fee_recipient: None,
         }
     }
 }
@@ -115,6 +119,55 @@ impl DropConfig {
 
         Ok(data)
     }
+
+    /// Builds exact SeaDrop mintPublic calldata: mintPublic(address,address,address,uint256)
+    pub fn build_seadrop_calldata(&self, minter: Option<&str>, quantity: u64) -> Result<Vec<u8>, String> {
+        let nft_addr = alloy::primitives::Address::from_str(self.target_contract.trim())
+            .map_err(|e| format!("Invalid target NFT contract address for SeaDrop: {e}"))?;
+
+        let fee_recipient_str = self.seadrop_fee_recipient.as_deref()
+            .unwrap_or("0x0000a26b00c1f0df003000390027140000faa719");
+        let fee_addr = alloy::primitives::Address::from_str(fee_recipient_str.trim())
+            .map_err(|e| format!("Invalid SeaDrop fee recipient address: {e}"))?;
+
+        let minter_addr = match minter {
+            Some(m) => alloy::primitives::Address::from_str(m.trim())
+                .unwrap_or(alloy::primitives::Address::ZERO),
+            None => alloy::primitives::Address::ZERO,
+        };
+
+        // Selector for mintPublic(address,address,address,uint256) is 0x161ac21f
+        let mut data = Vec::with_capacity(4 + 32 * 4);
+        data.extend_from_slice(&[0x16, 0x1a, 0xc2, 0x1f]);
+
+        let mut w1 = [0u8; 32];
+        w1[12..32].copy_from_slice(nft_addr.as_slice());
+        data.extend_from_slice(&w1);
+
+        let mut w2 = [0u8; 32];
+        w2[12..32].copy_from_slice(fee_addr.as_slice());
+        data.extend_from_slice(&w2);
+
+        let mut w3 = [0u8; 32];
+        w3[12..32].copy_from_slice(minter_addr.as_slice());
+        data.extend_from_slice(&w3);
+
+        let mut w4 = [0u8; 32];
+        let q_bytes = quantity.to_be_bytes();
+        w4[24..32].copy_from_slice(&q_bytes);
+        data.extend_from_slice(&w4);
+
+        Ok(data)
+    }
+
+    /// Resolves the on-chain destination contract address for the transaction (SeaDrop contract if active, or target NFT contract).
+    pub fn get_dispatch_destination<'a>(&'a self, fallback_target: &'a str) -> &'a str {
+        if let Some(ref sd) = self.seadrop_contract {
+            sd.as_str()
+        } else {
+            fallback_target
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +217,8 @@ impl Default for AppConfig {
                     "publicSaleActive()".to_string(),
                     "saleIsActive()".to_string(),
                 ],
+                seadrop_contract: None,
+                seadrop_fee_recipient: None,
             },
             gas: GasConfig {
                 max_fee_gwei: 50.0,

@@ -44,12 +44,18 @@ fn prepare_snipes(
     };
     let value = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
 
+    let destination = config.drop.get_dispatch_destination(target_contract);
+
     for worker in workers {
-        let calldata = config.drop.build_calldata_for_caller(Some(&worker.address)).unwrap_or_default();
+        let calldata = if config.drop.seadrop_contract.is_some() {
+            config.drop.build_seadrop_calldata(Some(&worker.address), 1).unwrap_or_default()
+        } else {
+            config.drop.build_calldata_for_caller(Some(&worker.address)).unwrap_or_default()
+        };
         let nonce = worker.nonce_mgr.current();
         if let Ok((raw_tx, n)) = worker.build_and_sign_eip1559(
             config.chain.chain_id,
-            target_contract,
+            destination,
             &calldata,
             value,
             config.gas.gas_limit,
