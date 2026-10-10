@@ -7,13 +7,10 @@ use alloy::signers::SignerSync;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use alloy::signers::local::PrivateKeySigner;
-
 pub struct WalletWorker {
     pub address: String,
     pub nonce_mgr: Arc<NonceManager>,
     pub key: ProtectedKey,
-    pub signer: PrivateKeySigner,
 }
 
 impl WalletWorker {
@@ -27,7 +24,6 @@ impl WalletWorker {
             address: addr_str,
             nonce_mgr,
             key,
-            signer,
         })
     }
 
@@ -62,7 +58,9 @@ impl WalletWorker {
 
         // Compute EIP-1559 signature hash
         let sighash = tx.signature_hash();
-        let signature = self.signer.sign_hash_sync(&sighash)?;
+        let signer = create_signer_from_protected(&self.key)?;
+        let signature = signer.sign_hash_sync(&sighash)?;
+        drop(signer); // Wipe unpinned signer scalar immediately
         let signed_tx = tx.into_signed(signature);
 
         // Encode into standard EIP-2718 typed transaction payload

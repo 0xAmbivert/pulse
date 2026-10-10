@@ -1,8 +1,9 @@
 use super::countdown::SnipeTrigger;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::info;
 
 pub struct MempoolScanner {
@@ -97,6 +98,8 @@ impl MempoolScanner {
                         .build()
                         .unwrap_or_else(|_| Client::new());
 
+                    let sem = Arc::new(Semaphore::new(16));
+
                     while let Some(msg_res) = read.next().await {
                         match msg_res {
                             Ok(Message::Text(text)) => {
@@ -105,37 +108,60 @@ impl MempoolScanner {
                                         .and_then(|p| p.get("result"))
                                         .and_then(|r| r.as_str())
                                     {
-                                        let get_tx = json!({
-                                            "jsonrpc": "2.0",
-                                            "id": 1,
-                                            "method": "eth_getTransactionByHash",
-                                            "params": [tx_hash]
-                                        });
-                                        if let Ok(resp) = client.post(&http_url).json(&get_tx).send().await {
-                                            if let Ok(body) = resp.json::<Value>().await {
-                                                if let Some(tx_obj) = body.get("result") {
-                                                    let sender_addr = tx_obj.get("from").and_then(|f| f.as_str()).unwrap_or("").to_lowercase();
-                                                    let to_addr = tx_obj.get("to").and_then(|t| t.as_str()).unwrap_or("").to_lowercase();
-                                                    let input_data = tx_obj.get("input").and_then(|i| i.as_str()).unwrap_or("");
+                                        let sem_c = sem.clone();
+                                        let client_c = client.clone();
+                                        let http_url_c = http_url.clone();
+                                        let tx_hash_str = tx_hash.to_string();
+                                        let trigger_tx_c = trigger_tx.clone();
+                                        let selectors_c = self.selectors.clone();
+                                        let owner_addr_c = self.owner_address.clone();
+                                        let target_contract_c = self.target_contract.clone();
 
-                                                    let is_owner_match = self.owner_address.as_ref().is_none_or(|o| *o == sender_addr);
-                                                    let target_matches = to_addr == self.target_contract;
-                                                    let selector_matches = self.matches_selector(input_data);
+                                        tokio::spawn(async move {
+                                            let _permit = match sem_c.acquire().await {
+                                                Ok(p) => p,
+                                                Err(_) => return,
+                                            };
+                                            let get_tx = json!({
+                                                "jsonrpc": "2.0",
+                                                "id": 1,
+                                                "method": "eth_getTransactionByHash",
+                                                "params": [tx_hash_str]
+                                            });
+                                            if let Ok(resp) = client_c.post(&http_url_c).json(&get_tx).send().await {
+                                                if let Ok(body) = resp.json::<Value>().await {
+                                                    if let Some(tx_obj) = body.get("result") {
+                                                        let sender_addr = tx_obj.get("from").and_then(|f| f.as_str()).unwrap_or("").to_lowercase();
+                                                        let to_addr = tx_obj.get("to").and_then(|t| t.as_str()).unwrap_or("").to_lowercase();
+                                                        let input_data = tx_obj.get("input").and_then(|i| i.as_str()).unwrap_or("");
 
-                                                    if is_owner_match && target_matches && selector_matches {
-                                                        info!(
-                                                            "WS Mempool sniper detected matching trigger tx: {} from {} to {}",
-                                                            tx_hash, sender_addr, to_addr
-                                                        );
-                                                        let _ = trigger_tx.send(SnipeTrigger::MempoolDetected {
-                                                            owner_tx_hash: tx_hash.to_string(),
-                                                            method: input_data.chars().take(10).collect(),
-                                                        }).await;
-                                                        return;
+                                                        let is_owner_match = owner_addr_c.as_ref().is_none_or(|o| *o == sender_addr);
+                                                        let target_matches = to_addr == target_contract_c;
+                                                        let clean = input_data.trim_start_matches("0x");
+                                                        let selector_matches = if clean.len() >= 8 {
+                                                            if let Ok(bytes) = hex::decode(&clean[0..8]) {
+                                                                selectors_c.iter().any(|s| s == bytes.as_slice())
+                                                            } else {
+                                                                false
+                                                            }
+                                                        } else {
+                                                            false
+                                                        };
+
+                                                        if is_owner_match && target_matches && selector_matches {
+                                                            info!(
+                                                                "WS Mempool sniper detected matching trigger tx: {} from {} to {}",
+                                                                tx_hash_str, sender_addr, to_addr
+                                                            );
+                                                            let _ = trigger_tx_c.send(SnipeTrigger::MempoolDetected {
+                                                                owner_tx_hash: tx_hash_str,
+                                                                method: input_data.chars().take(10).collect(),
+                                                            }).await;
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
+                                        });
                                     }
                                 }
                             }

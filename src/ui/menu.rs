@@ -90,30 +90,35 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                             (resolved.contract_address, None, None)
                         }
                         Err(e) => {
-                            println!("⚠️ OpenSea resolution note: {}. Using raw input.", e);
-                            (target_input, None, None)
+                            println!("❌ Failed to resolve OpenSea slug ({}). Please enter the 42-character 0x contract address directly.", e);
+                            continue;
                         }
                     }
                 } else {
+                    if !target_input.starts_with("0x") || target_input.len() != 42 {
+                        println!("❌ Invalid contract address: expected 42-character 0x address or valid OpenSea collection link.");
+                        continue;
+                    }
                     (target_input, None, None)
                 };
 
-                // 3. RPC URL (Optional: Enter to keep public default from config)
-                let default_rpc = base_config.chain.rpc_urls.first().cloned().unwrap_or_else(|| "https://rpc.mainnet.chain.robinhood.com".to_string());
-                print!("3️⃣  Enter RPC URL (Press Enter for public default '{}'): ", default_rpc);
+                // 3. RPC URLs (Optional: Enter to keep configured pool)
+                let default_rpcs = base_config.chain.rpc_urls.join(", ");
+                print!("3️⃣  Enter RPC URLs (comma-separated, or Press Enter to keep '{}'): ", default_rpcs);
                 io::stdout().flush()?;
                 let mut rpc_input = String::new();
                 io::stdin().read_line(&mut rpc_input)?;
-                let rpc_url = if rpc_input.trim().is_empty() {
-                    default_rpc
+                let rpc_urls: Vec<String> = if rpc_input.trim().is_empty() {
+                    base_config.chain.rpc_urls.clone()
                 } else {
-                    rpc_input.trim().to_string()
+                    rpc_input.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
                 };
+                let primary_rpc = rpc_urls.first().cloned().unwrap_or_else(|| "https://rpc.mainnet.chain.robinhood.com".to_string());
 
                 // Check on-chain SeaDrop parameters if applicable
                 let mut seadrop_contract = None;
                 let mut seadrop_fee = None;
-                let seadrop_inspector = crate::eligibility::seadrop::SeaDropInspector::new(&rpc_url);
+                let seadrop_inspector = crate::eligibility::seadrop::SeaDropInspector::new(&primary_rpc);
                 if let Some(sd) = seadrop_inspector.fetch_public_drop(&target_addr).await {
                     println!("🌊 Detected SeaDrop protocol drop! Price: {} Wei ({:.6} ETH), Max per wallet: {}", sd.mint_price_wei, sd.mint_price_wei as f64 / 1e18, sd.max_per_wallet);
                     detected_price_wei = Some(sd.mint_price_wei.to_string());
@@ -193,7 +198,7 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
 
                 // Construct session configuration strictly in memory (NEVER saved to file)
                 let mut session_config = base_config.clone();
-                session_config.chain.rpc_urls = vec![rpc_url];
+                session_config.chain.rpc_urls = rpc_urls;
                 session_config.drop.target_contract = target_addr;
                 session_config.drop.mint_function = mint_function;
                 session_config.drop.mint_value_wei = mint_value_wei;

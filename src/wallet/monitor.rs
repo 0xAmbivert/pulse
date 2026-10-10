@@ -25,7 +25,7 @@ pub fn spawn_tx_monitor(
     alerts: Arc<AlertDispatcher>,
     gas_engine: Arc<GasEngine>,
     chain_id: u64,
-    target_contract: String,
+    destination_contract: String,
     auto_speedup: bool,
     speedup_threshold_ms: u64,
     gas_limit: u64,
@@ -83,7 +83,7 @@ pub fn spawn_tx_monitor(
                     Ok((new_max, new_prio)) => {
                         match tx.worker.build_and_sign_eip1559(
                             chain_id,
-                            &target_contract,
+                            &destination_contract,
                             &tx.calldata,
                             tx.value_wei,
                             gas_limit,

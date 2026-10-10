@@ -190,6 +190,104 @@ impl MevBuilderClient {
 
         outcomes
     }
+
+    /// Dispatches an atomic MEV bundle (eth_sendBundle) targeting a specific block number.
+    /// This guarantees inclusion at the target block with revert-protection.
+    pub async fn send_bundle(&self, raw_txs: &[String], target_block: u64) -> Vec<BuilderOutcome> {
+        let block_hex = format!("0x{:x}", target_block);
+        let txs: Vec<String> = raw_txs.iter().map(|tx| {
+            if tx.starts_with("0x") { tx.clone() } else { format!("0x{tx}") }
+        }).collect();
+
+        let mut handles = Vec::new();
+        for url in &self.builder_urls {
+            let client = self.client.clone();
+            let builder_url = url.clone();
+            let mev_identity = self.mev_identity.clone();
+            let block = block_hex.clone();
+            let bundle_txs = txs.clone();
+
+            handles.push(tokio::spawn(async move {
+                let start = Instant::now();
+                let payload = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_sendBundle",
+                    "params": [{
+                        "txs": bundle_txs,
+                        "blockNumber": block
+                    }]
+                });
+                let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+                let body_hash = keccak256(payload_str.as_bytes());
+                let eip191_hash = eip191_hash_message(body_hash);
+                if let Ok(sig) = mev_identity.sign_hash_sync(&eip191_hash) {
+                    let addr_hex = format!("{:#x}", mev_identity.address());
+                    let auth_header = format!("{}:0x{}", addr_hex, hex::encode(sig.as_bytes()));
+                    match client.post(&builder_url)
+                        .header("X-Flashbots-Signature", auth_header)
+                        .header("Content-Type", "application/json")
+                        .body(payload_str)
+                        .send().await
+                    {
+                        Ok(resp) => {
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            if let Ok(body) = resp.json::<Value>().await {
+                                if let Some(err) = body.get("error") {
+                                    BuilderOutcome {
+                                        builder_url,
+                                        duration_ms,
+                                        success: false,
+                                        response: None,
+                                        error: Some(err.to_string()),
+                                    }
+                                } else {
+                                    BuilderOutcome {
+                                        builder_url,
+                                        duration_ms,
+                                        success: true,
+                                        response: body.get("result").map(|r| r.to_string()),
+                                        error: None,
+                                    }
+                                }
+                            } else {
+                                BuilderOutcome {
+                                    builder_url,
+                                    duration_ms,
+                                    success: false,
+                                    response: None,
+                                    error: Some("Failed to decode response".to_string()),
+                                }
+                            }
+                        }
+                        Err(e) => BuilderOutcome {
+                            builder_url,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            success: false,
+                            response: None,
+                            error: Some(e.to_string()),
+                        },
+                    }
+                } else {
+                    BuilderOutcome {
+                        builder_url,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        success: false,
+                        response: None,
+                        error: Some("Failed to sign bundle payload".to_string()),
+                    }
+                }
+            }));
+        }
+
+        let mut outcomes = Vec::new();
+        for handle in handles {
+            if let Ok(res) = handle.await {
+                outcomes.push(res);
+            }
+        }
+        outcomes
+    }
 }
 
 #[cfg(test)]

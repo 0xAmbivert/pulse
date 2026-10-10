@@ -2,3 +2,6 @@
 /keystores/
 config.toml
 *.env
+SECURITY_AUDIT_REPORT.md
+*audit*
+*report*.md

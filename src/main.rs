@@ -36,12 +36,9 @@ fn prepare_snipes(
     target_contract: &str,
     current_base_fee_wei: u128,
     gas_engine: &GasEngine,
-) -> Vec<PreparedSnipe> {
+) -> Result<Vec<PreparedSnipe>, pulse::gas::GasError> {
     let mut snipes = Vec::new();
-    let (max_fee_wei, max_priority_fee_wei) = match gas_engine.calculate_dynamic_fees(current_base_fee_wei, None) {
-        Ok(fees) => fees,
-        Err(_) => (gwei_to_wei(config.gas.max_fee_gwei), gwei_to_wei(config.gas.max_priority_fee_gwei)),
-    };
+    let (max_fee_wei, max_priority_fee_wei) = gas_engine.calculate_dynamic_fees(current_base_fee_wei, None)?;
     let value = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
 
     let destination = config.drop.get_dispatch_destination(target_contract);
@@ -77,7 +74,7 @@ fn prepare_snipes(
             });
         }
     }
-    snipes
+    Ok(snipes)
 }
 
 #[derive(Parser)]
@@ -237,10 +234,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.add_log(format!("🌐 Active RPC Endpoints: {}", endpoints.len()));
 
     // 6. Advisory Pre-Flight Simulation (Ensures contract & calldata are valid at boot without deadlocking triggers)
-    let sim_calldata = config.drop.build_calldata().unwrap_or_default();
+    let sim_dest = config.drop.get_dispatch_destination(&target_contract);
+    let sim_calldata = if config.drop.seadrop_contract.is_some() {
+        config.drop.build_seadrop_calldata(Some(&workers[0].address), 1).unwrap_or_default()
+    } else {
+        config.drop.build_calldata_for_caller(Some(&workers[0].address)).unwrap_or_default()
+    };
     let sim_val = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
     let simulator = RpcSimulator::new(&endpoints[0].url);
-    if let Ok(sim_res) = simulator.simulate_call(&workers[0].address, &target_contract, &sim_calldata, sim_val, config.gas.gas_limit).await {
+    if let Ok(sim_res) = simulator.simulate_call(&workers[0].address, sim_dest, &sim_calldata, sim_val, config.gas.gas_limit).await {
         if !sim_res.success {
             state.add_log(format!("⚠️ Advisory pre-flight simulation reverted (expected if drop unopen): {:?}", sim_res.revert_reason));
         } else {
@@ -249,14 +251,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Pre-Sign Transactions ahead of drop for instantaneous, zero-latency burst dispatch
-    let mut prepared_snipes = prepare_snipes(
+    let mut prepared_snipes = match prepare_snipes(
         &workers,
         &config,
         &target_contract,
         gwei_to_wei(state.current_base_fee),
         &gas_engine,
-    );
-    state.add_log(format!("⚡ Pre-signed {} transactions ahead of drop (zero-latency ready)", prepared_snipes.len()));
+    ) {
+        Ok(snipes) => {
+            state.add_log(format!("⚡ Pre-signed {} transactions ahead of drop (zero-latency ready)", snipes.len()));
+            snipes
+        }
+        Err(e) => {
+            state.add_log(format!("⚠️ Initial base fee exceeds ceiling: {e}; holding dispatch"));
+            Vec::new()
+        }
+    };
+
+    // Independent background keep-alive ping & telemetry updater (decoupled from UI tick loop to avoid blocking)
+    let racer_telemetry = rpc_racer.clone();
+    let (latency_tx, mut latency_rx) = mpsc::channel::<Option<u64>>(10);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(1500));
+        loop {
+            interval.tick().await;
+            let lats = racer_telemetry.benchmark_latencies().await;
+            let min_lat = lats.iter().filter_map(|(_, l)| *l).min();
+            let _ = latency_tx.send(min_lat).await;
+        }
+    });
 
     let mut has_fired = false;
 
@@ -283,18 +306,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 #[cfg(not(unix))]
                 { std::future::pending::<()>().await; }
             } => break,
+            Some(min_lat) = latency_rx.recv() => {
+                state.latency_ms = min_lat;
+            }
             Some(log_msg) = ui_log_rx.recv() => {
                 state.add_log(log_msg);
             }
             Some(event) = events.next() => {
                 match event {
                     AppEvent::Input(key) => state.handle_key(key.code),
-                    AppEvent::Tick => {
-                        // Keep-alive connection ping & telemetry update
-                        let racer = rpc_racer_clone.clone();
-                        let lats = racer.benchmark_latencies().await;
-                        state.latency_ms = lats.iter().filter_map(|(_, l)| *l).min();
-                    }
+                    AppEvent::Tick => {}
                 }
             }
             Some(trigger) = trigger_rx.recv() => {
@@ -302,7 +323,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     SnipeTrigger::BaseFeeUpdated { base_fee_wei } => {
                         state.current_base_fee = wei_to_gwei(*base_fee_wei);
                         if !has_fired {
-                            prepared_snipes = prepare_snipes(&workers, &config, &target_contract, *base_fee_wei, &gas_engine);
+                            match prepare_snipes(&workers, &config, &target_contract, *base_fee_wei, &gas_engine) {
+                                Ok(snipes) => prepared_snipes = snipes,
+                                Err(e) => {
+                                    state.add_log(format!("⚠️ Base fee ({:.2} Gwei) exceeds ceiling: {e}; holding dispatch", state.current_base_fee));
+                                    prepared_snipes.clear();
+                                }
+                            }
                         }
                         continue;
                     },
@@ -324,9 +351,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     alerts_c.dispatch_alert("🚨 Snipe Trigger Fired", &desc, true).await;
                 });
 
+                if prepared_snipes.is_empty() {
+                    state.add_log("⛔ Snipe aborted: current gas fee exceeds ceiling or no transactions prepared.".to_string());
+                    has_fired = false;
+                    continue;
+                }
+
                 // ZERO-LATENCY DISPATCH: blast pre-signed transactions immediately!
                 for prepared in &prepared_snipes {
                     state.add_log(format!("🚀 Blasting pre-signed tx for {} (Nonce: {}, Hash: {})", prepared.worker.address, prepared.nonce, prepared.tx_hash));
+                    prepared.worker.nonce_mgr.set_nonce(prepared.nonce + 1);
 
                     let submitted = SubmittedTx {
                         worker: prepared.worker.clone(),
@@ -348,23 +382,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         alerts_c.dispatch_alert("🚀 Mint Tx Broadcast", &format!("Wallet: {}\nNonce: {}\nTx: {}", addr, nonce, h), true).await;
                     });
 
-                    // Concurrent Dual Broadcasting on L1: transmit to BOTH MEV builders and public RPC endpoints simultaneously!
+                    // MEV Private Relay on L1 (Never leak to public mempool at T+0; fallback only if rejected)
                     if let Some(mev) = &mev_client {
                         let mev_clone = mev.clone();
                         let tx_clone = prepared.raw_tx.clone();
                         let alerts_c = alerts.clone();
+                        let racer_fallback = rpc_racer_clone.clone();
                         tokio::spawn(async move {
                             let outcomes = mev_clone.send_private_transaction(&tx_clone).await;
                             if !outcomes.iter().any(|o| o.success) {
-                                alerts_c.dispatch_alert("⚠️ All Builders Rejected", &format!("{:?}", outcomes), false).await;
+                                alerts_c.dispatch_alert("⚠️ All Builders Rejected, falling back to public RPC", &format!("{:?}", outcomes), false).await;
+                                let _ = racer_fallback.race_broadcast_raw_tx(&tx_clone).await;
                             }
-                        });
-
-                        // Concurrently race public RPC endpoints alongside MEV builders
-                        let racer = rpc_racer_clone.clone();
-                        let raw_tx_clone = prepared.raw_tx.clone();
-                        tokio::spawn(async move {
-                            let _outcomes = racer.race_broadcast_raw_tx(&raw_tx_clone).await;
                         });
                     } else {
                         // On L2 or without builders: race public RPC endpoints
@@ -375,7 +404,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         });
                     }
 
-                    // Background monitor for receipt & auto-speedup
+                    // Background monitor for receipt & auto-speedup (routes replacement to correct destination)
+                    let destination = config.drop.get_dispatch_destination(&target_contract);
                     spawn_tx_monitor(
                         submitted,
                         rpc_racer_clone.clone(),
@@ -383,7 +413,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         alerts.clone(),
                         gas_engine.clone(),
                         config.chain.chain_id,
-                        target_contract.clone(),
+                        destination.to_string(),
                         config.gas.auto_speedup,
                         config.gas.speedup_threshold_ms,
                         config.gas.gas_limit,

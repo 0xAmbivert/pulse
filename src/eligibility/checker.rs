@@ -132,12 +132,33 @@ impl EligibilityChecker {
                 }
             }
         } else {
-            // General NFT contract simulation
-            let calldata = format!("0xa0712d68{:0>64}", "1"); // mint(uint256)
+            // General NFT contract simulation: test standard function selectors
             let val_hex = format!("0x{:x}", price_wei);
-            match seadrop_inspector.simulate_mint(wallet_address, &target.contract_address, &calldata, &val_hex).await {
-                Ok(gas) => (true, "Eligible to Mint via Direct Contract".to_string(), Some(gas)),
-                Err(revert_msg) => {
+            let candidates = [
+                format!("0xa0712d68{:0>64}", "1"), // mint(uint256)
+                "0x1249c58b".to_string(),          // mint()
+                "0x4e71d92d".to_string(),          // claim()
+                "0xa6f2ae3a".to_string(),          // publicMint()
+            ];
+
+            let mut sim_success = None;
+            let mut last_revert = String::new();
+
+            for calldata in &candidates {
+                match seadrop_inspector.simulate_mint(wallet_address, &target.contract_address, calldata, &val_hex).await {
+                    Ok(gas) => {
+                        sim_success = Some(gas);
+                        break;
+                    }
+                    Err(e) => {
+                        last_revert = e;
+                    }
+                }
+            }
+
+            match sim_success {
+                Some(gas) => (true, "Eligible to Mint via Direct Contract".to_string(), Some(gas)),
+                None => {
                     // Check MintGo live mint-tx endpoint as secondary signal
                     if let Ok(tx_val) = self.mintgo.check_mint_tx(&target.chain, &target.contract_address, wallet_address, 1).await {
                         if let Some(err) = tx_val.get("error").and_then(|e| e.as_str()) {
@@ -146,7 +167,7 @@ impl EligibilityChecker {
                             (true, "Eligible (Verified by MintGo)".to_string(), None)
                         }
                     } else {
-                        (false, format!("Contract Reverted: {revert_msg}"), None)
+                        (false, format!("Contract Reverted: {last_revert}"), None)
                     }
                 }
             }
