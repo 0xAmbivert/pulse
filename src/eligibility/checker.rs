@@ -93,7 +93,12 @@ impl EligibilityChecker {
         // Unknown per-wallet state is not treated as zero minted; see `wallet_state_known`.
         let wallet_state_known = onchain_stats.is_some() || seadrop_public.is_some();
         let minted_by_wallet = onchain_stats.map(|(w, _, _)| w).unwrap_or(0);
-        let max_per_wallet = seadrop_public.as_ref().map(|sd| sd.max_per_wallet).unwrap_or(0);
+        let max_per_wallet = seadrop_public
+            .as_ref()
+            .map(|sd| sd.max_per_wallet)
+            .or_else(|| stages.iter().find(|s| s.is_active_now).and_then(|s| s.max_per_wallet))
+            .or_else(|| stages.first().and_then(|s| s.max_per_wallet))
+            .unwrap_or(0);
         let price_wei = seadrop_public.as_ref().map(|sd| sd.mint_price_wei)
             .or_else(|| stages.iter().find(|s| s.is_active_now).map(|s| s.price_wei))
             .unwrap_or(0);
@@ -101,6 +106,8 @@ impl EligibilityChecker {
 
         let remaining = if is_sold_out || !wallet_state_known {
             0
+        } else if max_per_wallet == 0 {
+            max_supply.map_or(u64::MAX, |m| m.saturating_sub(minted_supply))
         } else {
             max_per_wallet.saturating_sub(minted_by_wallet)
         };
@@ -225,9 +232,19 @@ impl EligibilityChecker {
 
         out.push_str(&format!("  🎫 Wallet Status ({}):\n", report.wallet_status.wallet_address));
         out.push_str(&format!("     Minted So Far: {}\n", report.wallet_status.minted_by_wallet));
-        out.push_str(&format!("     Max Per Wallet:{}\n", report.wallet_status.max_per_wallet));
-        out.push_str(&format!("     Remaining:     {}\n", report.wallet_status.remaining_mintable));
-        out.push_str(&format!("     Unit Price:    {:.6} ETH ({} Wei)\n\n", report.wallet_status.price_eth, report.wallet_status.price_wei));
+        let max_str = if report.wallet_status.max_per_wallet == 0 {
+            "Unlimited / Stage Capped".to_string()
+        } else {
+            format!("{}", report.wallet_status.max_per_wallet)
+        };
+        let rem_str = if report.wallet_status.remaining_mintable == u64::MAX {
+            "Unlimited".to_string()
+        } else {
+            format!("{}", report.wallet_status.remaining_mintable)
+        };
+        out.push_str(&format!("     Max Per Wallet: {}\n", max_str));
+        out.push_str(&format!("     Remaining:      {}\n", rem_str));
+        out.push_str(&format!("     Unit Price:     {:.6} ETH ({} Wei)\n\n", report.wallet_status.price_eth, report.wallet_status.price_wei));
 
         if !report.stages.is_empty() {
             out.push_str("  🗓️ Mint Stages (MintGo / OpenSea Radar):\n");
@@ -241,7 +258,7 @@ impl EligibilityChecker {
         out.push_str("  🏁 Eligibility Verdict:\n");
         if report.wallet_status.is_eligible {
             let gas_info = report.wallet_status.simulated_gas_used.map_or(String::new(), |g| format!(" (Simulated Gas: {g})"));
-            out.push_str(&format!("     ✅ ELIGIBLE TO MINT! (Can mint up to {} tokens){gas_info}\n", report.wallet_status.remaining_mintable));
+            out.push_str(&format!("     ✅ ELIGIBLE TO MINT! (Can mint up to {} tokens){gas_info}\n", rem_str));
         } else {
             out.push_str(&format!("     ⛔ NOT ELIGIBLE: {}\n", report.wallet_status.status_reason));
         }

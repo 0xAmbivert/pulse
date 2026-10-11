@@ -160,17 +160,22 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                     mint_sig.trim().to_string()
                 };
 
-                // 5. Mint Value in Wei (Optional: Enter for default)
+                // 5. Mint Value in Wei (Optional: Enter for default). Invalid input re-prompts.
                 let default_val_wei = detected_price_wei.unwrap_or_else(|| base_config.drop.mint_value_wei.clone());
-                print!("5️⃣  Enter Mint Value in Wei (Press Enter for '{}'): ", default_val_wei);
-                io::stdout().flush()?;
-                let Some(val_input) = read_line_opt()? else {
-                    return Ok(MenuAction::Exit);
-                };
-                let mint_value_wei = if val_input.trim().is_empty() {
-                    default_val_wei
-                } else {
-                    val_input.trim().to_string()
+                let mint_value_wei = loop {
+                    print!("5️⃣  Enter Mint Value in Wei (Press Enter for '{}'): ", default_val_wei);
+                    io::stdout().flush()?;
+                    let Some(val_input) = read_line_opt()? else {
+                        return Ok(MenuAction::Exit);
+                    };
+                    let trimmed = val_input.trim();
+                    if trimmed.is_empty() {
+                        break default_val_wei.clone();
+                    }
+                    if trimmed.parse::<u128>().is_ok() {
+                        break trimmed.to_string();
+                    }
+                    println!("❌ Invalid mint value '{trimmed}'. Enter an integer number of Wei (e.g. 0).");
                 };
 
                 // 6. Max Gas Fee in Gwei (Optional: Enter for default). Invalid input re-prompts.
@@ -289,8 +294,16 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                             continue;
                         }
                         if !report.wallet_status.is_eligible {
-                            println!("⛔ Wallet is not eligible ({}). Sniper not offered.", report.wallet_status.status_reason);
-                            continue;
+                            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                            let is_upcoming = report.seadrop_config.as_ref().is_some_and(|sd| now < sd.start_time)
+                                || report.stages.iter().any(|st| st.start_time_unix.is_some_and(|t| now < t));
+
+                            if is_upcoming {
+                                println!("⏳ Drop is upcoming (not yet active). You can arm the sniper with a countdown timer.");
+                            } else {
+                                println!("⛔ Wallet is not eligible ({}). Sniper not offered.", report.wallet_status.status_reason);
+                                continue;
+                            }
                         }
 
                         print!("👉 Would you like to load this contract into the Sniper now? [y/N]: ");
@@ -323,6 +336,15 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                                 session_config.chain.rpc_urls = pool;
                                 session_config.drop.target_contract = report.target.contract_address.clone();
                                 session_config.drop.mint_value_wei = report.wallet_status.price_wei.to_string();
+
+                                // Pre-fill countdown timer if drop is upcoming
+                                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                if let Some(ref sd) = report.seadrop_config {
+                                    if sd.start_time > now {
+                                        session_config.drop.target_timestamp = Some(sd.start_time);
+                                        println!("⏱️ Pre-configured countdown timer to start time: {}", sd.start_time);
+                                    }
+                                }
 
                                 if report.drop_mechanism.contains("SeaDrop") {
                                     session_config.drop.seadrop_contract = Some(crate::eligibility::seadrop::SEADROP_V1_ADDRESS.to_string());
