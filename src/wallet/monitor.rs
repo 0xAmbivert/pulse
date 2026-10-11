@@ -5,6 +5,9 @@ use crate::gas::{wei_to_gwei, GasEngine};
 use crate::network::{MevBuilderClient, RpcRacer};
 use crate::wallet::WalletWorker;
 
+/// Maximum time to keep tracking a submitted transaction before giving up.
+const MONITOR_ABANDON_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub struct SubmittedTx {
     pub worker: Arc<WalletWorker>,
     pub tx_hash: String,
@@ -33,8 +36,17 @@ pub fn spawn_tx_monitor(
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        let started = std::time::Instant::now();
         loop {
             interval.tick().await;
+
+            // Stop tracking after the abandon window: the nonce may be consumed or the tx dropped.
+            if started.elapsed() >= MONITOR_ABANDON_AFTER {
+                let _ = ui_log_tx
+                    .send(format!("⏹️ Stopped tracking {} after {}s without a receipt", tx.tx_hash, MONITOR_ABANDON_AFTER.as_secs()))
+                    .await;
+                break;
+            }
 
             if let Some(receipt) = rpc_racer.poll_receipt(&tx.tx_hash).await {
                 let status_ok = receipt
@@ -92,8 +104,13 @@ pub fn spawn_tx_monitor(
                             Some(tx.nonce),
                         ) {
                             Ok((new_raw, _)) => {
-                                let new_bytes = hex::decode(new_raw.trim_start_matches("0x"))
-                                    .unwrap_or_default();
+                                let new_bytes = match hex::decode(new_raw.trim_start_matches("0x")) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        let _ = ui_log_tx.send(format!("⚠️ Speedup produced invalid hex: {e}")).await;
+                                        continue;
+                                    }
+                                };
                                 let new_hash =
                                     format!("{:#x}", alloy::primitives::keccak256(&new_bytes));
                                 tx.tx_hash = new_hash.clone();

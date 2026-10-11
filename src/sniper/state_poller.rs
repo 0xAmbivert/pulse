@@ -25,7 +25,7 @@ impl StatePoller {
     }
 
     /// Continuously polls the view function of the target contract.
-    /// Fires when the returned boolean turns true (i.e. not all zeros).
+    /// Fires when the ABI-encoded bool return value equals 1 (the full 32-byte word).
     pub async fn run_poll_loop(&self, trigger_tx: mpsc::Sender<SnipeTrigger>) {
         let client = Client::builder()
             .timeout(Duration::from_millis(1000))
@@ -51,9 +51,9 @@ impl StatePoller {
                 if let Ok(body) = resp.json::<Value>().await {
                     if let Some(result_hex) = body.get("result").and_then(|r| r.as_str()) {
                         let clean = result_hex.trim_start_matches("0x");
-                        // Treat any non-zero returned value as active / true
+                        // ABI bool: the 32-byte word must be exactly 1.
                         if let Ok(bytes) = hex::decode(clean) {
-                            if bytes.iter().any(|&b| b != 0) {
+                            if bytes.len() == 32 && bytes[..31].iter().all(|&b| b == 0) && bytes[31] == 1 {
                                 info!("StatePoller detected sale is now active on contract: {}", self.target_contract);
                                 let _ = trigger_tx.send(SnipeTrigger::StateFlipDetected { new_state: true }).await;
                                 return;

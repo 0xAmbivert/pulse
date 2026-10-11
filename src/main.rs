@@ -36,21 +36,25 @@ fn prepare_snipes(
     target_contract: &str,
     current_base_fee_wei: u128,
     gas_engine: &GasEngine,
-) -> Result<Vec<PreparedSnipe>, pulse::gas::GasError> {
+) -> Result<Vec<PreparedSnipe>, Box<dyn std::error::Error + Send + Sync>> {
     let mut snipes = Vec::new();
     let (max_fee_wei, max_priority_fee_wei) = gas_engine.calculate_dynamic_fees(current_base_fee_wei, None)?;
-    let value = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
+    let value = config
+        .drop
+        .mint_value_wei
+        .parse::<u128>()
+        .map_err(|e| format!("Invalid mint value in wei '{}': {e}", config.drop.mint_value_wei))?;
 
     let destination = config.drop.get_dispatch_destination(target_contract);
 
     for worker in workers {
         let calldata = if config.drop.seadrop_contract.is_some() {
-            config.drop.build_seadrop_calldata(Some(&worker.address), 1).unwrap_or_default()
+            config.drop.build_seadrop_calldata(Some(&worker.address), 1)?
         } else {
-            config.drop.build_calldata_for_caller(Some(&worker.address)).unwrap_or_default()
+            config.drop.build_calldata_for_caller(Some(&worker.address))?
         };
         let nonce = worker.nonce_mgr.current();
-        if let Ok((raw_tx, n)) = worker.build_and_sign_eip1559(
+        let (raw_tx, n) = worker.build_and_sign_eip1559(
             config.chain.chain_id,
             destination,
             &calldata,
@@ -59,20 +63,20 @@ fn prepare_snipes(
             max_fee_wei,
             max_priority_fee_wei,
             Some(nonce),
-        ) {
-            let tx_bytes = hex::decode(raw_tx.trim_start_matches("0x")).unwrap_or_default();
-            let tx_hash = format!("{:#x}", alloy::primitives::keccak256(&tx_bytes));
-            snipes.push(PreparedSnipe {
-                worker: worker.clone(),
-                raw_tx,
-                tx_hash,
-                nonce: n,
-                max_fee_wei,
-                priority_fee_wei: max_priority_fee_wei,
-                calldata,
-                value_wei: value,
-            });
-        }
+        )?;
+        let tx_bytes = hex::decode(raw_tx.trim_start_matches("0x"))
+            .map_err(|e| format!("Signed transaction is not valid hex: {e}"))?;
+        let tx_hash = format!("{:#x}", alloy::primitives::keccak256(&tx_bytes));
+        snipes.push(PreparedSnipe {
+            worker: worker.clone(),
+            raw_tx,
+            tx_hash,
+            nonce: n,
+            max_fee_wei,
+            priority_fee_wei: max_priority_fee_wei,
+            calldata,
+            value_wei: value,
+        });
     }
     Ok(snipes)
 }
@@ -88,6 +92,20 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
+    pulse::crypto::harden_process();
+
+    // Initialize file-backed tracing so logs/warnings are preserved without interfering with TUI
+    if let Ok(log_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/pulse.log")
+    {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(std::sync::Mutex::new(log_file))
+            .with_ansi(false)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
 
     // Create default config silently if it doesn't exist so load won't fail
     if !cli.config.exists() {
@@ -188,9 +206,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Some(owner.to_string()),
                 &config.drop.flip_function_signatures,
             );
-            // Run a quick match check to validate unused `matches_selector` method
-            let _ = scanner.matches_selector("0x12345678");
-
             let tx_clone = trigger_tx.clone();
             tokio::spawn(async move {
                 scanner.run_scan_loop(tx_clone).await;
@@ -236,18 +251,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 6. Advisory Pre-Flight Simulation (Ensures contract & calldata are valid at boot without deadlocking triggers)
     let sim_dest = config.drop.get_dispatch_destination(&target_contract);
     let sim_calldata = if config.drop.seadrop_contract.is_some() {
-        config.drop.build_seadrop_calldata(Some(&workers[0].address), 1).unwrap_or_default()
+        config.drop.build_seadrop_calldata(Some(&workers[0].address), 1)
     } else {
-        config.drop.build_calldata_for_caller(Some(&workers[0].address)).unwrap_or_default()
+        config.drop.build_calldata_for_caller(Some(&workers[0].address))
     };
-    let sim_val = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
-    let simulator = RpcSimulator::new(&endpoints[0].url);
-    if let Ok(sim_res) = simulator.simulate_call(&workers[0].address, sim_dest, &sim_calldata, sim_val, config.gas.gas_limit).await {
-        if !sim_res.success {
-            state.add_log(format!("⚠️ Advisory pre-flight simulation reverted (expected if drop unopen): {:?}", sim_res.revert_reason));
-        } else {
-            state.add_log(format!("✅ Pre-flight simulation passed ({} gas)", sim_res.gas_used));
+    match (sim_calldata, config.drop.mint_value_wei.parse::<u128>()) {
+        (Ok(sim_calldata), Ok(sim_val)) => {
+            let simulator = RpcSimulator::new(&endpoints[0].url);
+            match simulator.simulate_call(&workers[0].address, sim_dest, &sim_calldata, sim_val, config.gas.gas_limit).await {
+                Ok(sim_res) if !sim_res.success => {
+                    state.add_log(format!("⚠️ Advisory pre-flight simulation reverted (expected if drop unopen): {:?}", sim_res.revert_reason));
+                }
+                Ok(sim_res) => {
+                    state.add_log(format!("✅ Pre-flight simulation passed ({} gas)", sim_res.gas_used));
+                }
+                Err(e) => state.add_log(format!("⚠️ Pre-flight simulation could not run: {e}")),
+            }
         }
+        (Err(e), _) => state.add_log(format!("❌ Invalid calldata configuration: {e}")),
+        (_, Err(e)) => state.add_log(format!("❌ Invalid mint value in wei: {e}")),
     }
 
     // Pre-Sign Transactions ahead of drop for instantaneous, zero-latency burst dispatch
@@ -284,9 +306,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut has_fired = false;
 
     #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to bind SIGTERM");
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            state.add_log(format!("⚠️ Could not bind SIGTERM handler: {e}"));
+            None
+        }
+    };
     #[cfg(unix)]
-    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).expect("Failed to bind SIGHUP");
+    let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            state.add_log(format!("⚠️ Could not bind SIGHUP handler: {e}"));
+            None
+        }
+    };
 
     // Main Event Loop
     while state.is_running {
@@ -296,13 +330,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             _ = tokio::signal::ctrl_c() => break,
             _ = async {
                 #[cfg(unix)]
-                { sigterm.recv().await; }
+                { match sigterm.as_mut() { Some(s) => { s.recv().await; } None => std::future::pending::<()>().await } }
                 #[cfg(not(unix))]
                 { std::future::pending::<()>().await; }
             } => break,
             _ = async {
                 #[cfg(unix)]
-                { sighup.recv().await; }
+                { match sighup.as_mut() { Some(s) => { s.recv().await; } None => std::future::pending::<()>().await } }
                 #[cfg(not(unix))]
                 { std::future::pending::<()>().await; }
             } => break,

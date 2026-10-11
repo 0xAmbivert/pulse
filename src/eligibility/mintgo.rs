@@ -6,7 +6,7 @@ use crate::eligibility::types::MintStageInfo;
 
 pub struct MintGoClient {
     client: Client,
-    cached_cookie: RwLock<Option<String>>,
+    cached_cookie: RwLock<Option<(String, std::time::Instant)>>,
 }
 
 impl Default for MintGoClient {
@@ -28,11 +28,21 @@ impl MintGoClient {
         }
     }
 
+    /// Clears the cached session cookie.
+    pub fn clear_session(&self) {
+        if let Ok(mut guard) = self.cached_cookie.write() {
+            *guard = None;
+        }
+    }
+
     /// Initializes a browser session with MintGo to receive session cookies (mg_access, mg_vid).
+    /// Reuses session if under 20 minutes old (TTL is 30 minutes).
     pub async fn ensure_session(&self) -> Result<String, String> {
         if let Ok(guard) = self.cached_cookie.read() {
-            if let Some(ref c) = *guard {
-                return Ok(c.clone());
+            if let Some((ref c, ts)) = *guard {
+                if ts.elapsed() < Duration::from_secs(1200) {
+                    return Ok(c.clone());
+                }
             }
         }
 
@@ -57,22 +67,28 @@ impl MintGoClient {
 
         let cookie_str = cookies.join("; ");
         if let Ok(mut guard) = self.cached_cookie.write() {
-            *guard = Some(cookie_str.clone());
+            *guard = Some((cookie_str.clone(), std::time::Instant::now()));
         }
         Ok(cookie_str)
     }
 
     /// Fetches collection intelligence and mint stages from MintGo.
     pub async fn fetch_collection_intel(&self, chain: &str, contract: &str) -> Result<Value, String> {
-        let cookie = self.ensure_session().await.unwrap_or_default();
-        let url = format!("https://mintgo.fun/api/collection/{contract}?chain={chain}");
-        let mut req = self.client.get(&url).header("Referer", "https://mintgo.fun/");
+        let cookie = self.ensure_session().await?;
+        let url = format!("https://mintgo.fun/api/collection/{contract}");
+        let mut req = self.client.get(&url)
+            .query(&[("chain", chain)])
+            .header("Referer", "https://mintgo.fun/");
         if !cookie.is_empty() {
             req = req.header("Cookie", cookie);
         }
 
         let resp = req.send().await
             .map_err(|e| format!("MintGo API error: {e}"))?;
+
+        if resp.status().as_u16() == 401 {
+            self.clear_session();
+        }
 
         if !resp.status().is_success() {
             return Err(format!("MintGo returned HTTP {}", resp.status()));
@@ -85,15 +101,25 @@ impl MintGoClient {
 
     /// Checks live eligibility and transaction generation from MintGo.
     pub async fn check_mint_tx(&self, chain: &str, contract: &str, wallet: &str, quantity: u64) -> Result<Value, String> {
-        let cookie = self.ensure_session().await.unwrap_or_default();
-        let url = format!("https://mintgo.fun/api/mint-tx/{contract}?quantity={quantity}&from={wallet}&chain={chain}");
-        let mut req = self.client.get(&url).header("Referer", "https://mintgo.fun/");
+        let cookie = self.ensure_session().await?;
+        let url = format!("https://mintgo.fun/api/mint-tx/{contract}");
+        let mut req = self.client.get(&url)
+            .query(&[("quantity", quantity.to_string()), ("from", wallet.to_string()), ("chain", chain.to_string())])
+            .header("Referer", "https://mintgo.fun/");
         if !cookie.is_empty() {
             req = req.header("Cookie", cookie);
         }
 
         let resp = req.send().await
             .map_err(|e| format!("MintGo mint-tx request error: {e}"))?;
+
+        if resp.status().as_u16() == 401 {
+            self.clear_session();
+        }
+
+        if !resp.status().is_success() {
+            return Err(format!("MintGo mint-tx returned HTTP {}", resp.status()));
+        }
 
         let body: Value = resp.json().await
             .map_err(|e| format!("Failed to parse MintGo mint-tx JSON: {e}"))?;

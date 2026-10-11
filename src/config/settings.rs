@@ -55,6 +55,16 @@ impl Default for DropConfig {
     }
 }
 
+/// ABI-encodes an address as a 32-byte word. Missing or malformed callers are errors.
+fn encode_address_word(caller: Option<&str>) -> Result<[u8; 32], String> {
+    let c = caller.ok_or_else(|| "Mint function requires a caller address".to_string())?;
+    let addr = alloy::primitives::Address::from_str(c.trim())
+        .map_err(|e| format!("Invalid caller address '{c}': {e}"))?;
+    let mut word = [0u8; 32];
+    word[12..32].copy_from_slice(addr.as_slice());
+    Ok(word)
+}
+
 impl DropConfig {
     pub fn build_calldata(&self) -> Result<Vec<u8>, String> {
         self.build_calldata_for_caller(None)
@@ -84,12 +94,7 @@ impl DropConfig {
 
         // Recipient mints: mint(address,uint256)
         if func_sig.contains("address,uint256") {
-            let mut addr_bytes = [0u8; 32];
-            if let Some(c) = caller {
-                if let Ok(addr) = alloy::primitives::Address::from_str(c.trim()) {
-                    addr_bytes[12..32].copy_from_slice(addr.as_slice());
-                }
-            }
+            let addr_bytes = encode_address_word(caller)?;
             data.extend_from_slice(&addr_bytes);
             let mut amount = [0u8; 32];
             amount[31] = 1;
@@ -107,12 +112,7 @@ impl DropConfig {
 
         // Address only mints: mint(address)
         if func_sig.contains("address") && !func_sig.contains("uint256") {
-            let mut addr_bytes = [0u8; 32];
-            if let Some(c) = caller {
-                if let Ok(addr) = alloy::primitives::Address::from_str(c.trim()) {
-                    addr_bytes[12..32].copy_from_slice(addr.as_slice());
-                }
-            }
+            let addr_bytes = encode_address_word(caller)?;
             data.extend_from_slice(&addr_bytes);
             return Ok(data);
         }
@@ -132,12 +132,12 @@ impl DropConfig {
 
         let minter_addr = match minter {
             Some(m) => alloy::primitives::Address::from_str(m.trim())
-                .unwrap_or(alloy::primitives::Address::ZERO),
-            None => alloy::primitives::Address::ZERO,
+                .map_err(|e| format!("Invalid minter address for SeaDrop calldata: {e}"))?,
+            None => return Err("SeaDrop calldata requires a minter address".to_string()),
         };
 
         // Selector for mintPublic(address,address,address,uint256) is 0x161ac21f
-        let mut data = Vec::with_capacity(4 + 32 * 4);
+        let mut data: Vec<u8> = Vec::with_capacity(4 + 32 * 4);
         data.extend_from_slice(&[0x16, 0x1a, 0xc2, 0x1f]);
 
         let mut w1 = [0u8; 32];
@@ -318,12 +318,12 @@ mod tests {
     }
 
     #[test]
-    fn test_print_seadrop_selectors() {
+    fn test_seadrop_selectors_match_constants() {
         use alloy::primitives::keccak256;
-        println!("getPublicDrop(address): 0x{}", hex::encode(&keccak256("getPublicDrop(address)")[0..4]));
-        println!("getMintStats(address): 0x{}", hex::encode(&keccak256("getMintStats(address)")[0..4]));
-        println!("getAllowedFeeRecipients(address): 0x{}", hex::encode(&keccak256("getAllowedFeeRecipients(address)")[0..4]));
-        println!("getAllowListMerkleRoot(address): 0x{}", hex::encode(&keccak256("getAllowListMerkleRoot(address)")[0..4]));
-        println!("mintPublic(address,address,address,uint256): 0x{}", hex::encode(&keccak256("mintPublic(address,address,address,uint256)")[0..4]));
+        assert_eq!(&keccak256("getPublicDrop(address)")[0..4], &[0xbc, 0x6a, 0x62, 0x9c]);
+        assert_eq!(&keccak256("getMintStats(address)")[0..4], &[0x84, 0x0e, 0x15, 0xd4]);
+        assert_eq!(&keccak256("getAllowedFeeRecipients(address)")[0..4], &[0x68, 0x63, 0x22, 0x74]);
+        assert_eq!(&keccak256("getAllowListMerkleRoot(address)")[0..4], &[0x32, 0xbf, 0x11, 0xf5]);
+        assert_eq!(&keccak256("mintPublic(address,address,address,uint256)")[0..4], &[0x16, 0x1a, 0xc2, 0x1f]);
     }
 }

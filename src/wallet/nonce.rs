@@ -33,9 +33,14 @@ impl NonceManager {
 
     /// Resynchronizes the nonce by querying `eth_getTransactionCount` with tag "pending" from RPC.
     pub async fn resync_from_rpc(&self, rpc_url: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let client = Client::builder()
-            .timeout(Duration::from_millis(3000))
-            .build()?;
+        static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+        let client = match CLIENT.get() {
+            Some(c) => c,
+            None => {
+                let built = Client::builder().timeout(Duration::from_millis(3000)).build()?;
+                CLIENT.get_or_init(|| built)
+            }
+        };
 
         let payload = json!({
             "jsonrpc": "2.0",
@@ -44,16 +49,45 @@ impl NonceManager {
             "id": 1
         });
 
-        let resp = client.post(rpc_url).json(&payload).send().await?;
+        let resp = client.post(rpc_url).json(&payload).send().await?.error_for_status()?;
         let body: serde_json::Value = resp.json().await?;
 
-        if let Some(result_hex) = body.get("result").and_then(|r| r.as_str()) {
-            let clean_hex = result_hex.trim_start_matches("0x");
-            let nonce = u64::from_str_radix(clean_hex, 16)?;
-            self.set_nonce(nonce);
-            Ok(nonce)
-        } else {
-            Err("Failed to parse nonce from RPC response".into())
+        if let Some(err) = body.get("error") {
+            return Err(format!("RPC error fetching nonce: {err}").into());
         }
+        let result_hex = body
+            .get("result")
+            .and_then(|r| r.as_str())
+            .ok_or("Failed to parse nonce from RPC response")?;
+        let nonce = u64::from_str_radix(result_hex.trim_start_matches("0x"), 16)?;
+        self.set_nonce(nonce);
+        Ok(nonce)
+    }
+
+    /// Checks for nonce gaps: queries on-chain pending count and updates forward if on-chain nonce is ahead.
+    pub async fn resync_if_ahead(&self, rpc_url: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let on_chain = self.resync_from_rpc(rpc_url).await?;
+        let curr = self.current();
+        if on_chain > curr {
+            self.set_nonce(on_chain);
+            Ok(on_chain)
+        } else {
+            Ok(curr)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nonce_manager_atomic_increment() {
+        let mgr = NonceManager::new("0x1234567890123456789012345678901234567890", 5);
+        assert_eq!(mgr.current(), 5);
+        assert_eq!(mgr.get_and_increment(), 5);
+        assert_eq!(mgr.current(), 6);
+        mgr.set_nonce(10);
+        assert_eq!(mgr.current(), 10);
     }
 }

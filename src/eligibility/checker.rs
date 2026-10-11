@@ -123,7 +123,10 @@ impl EligibilityChecker {
                     .trim_start_matches("0x")
                     .to_lowercase();
 
-                let calldata = format!("0x161ac21f{:0>64}{:0>64}{:0>64}{:0>64}", clean_nft, clean_fee, "0", "1");
+                // The minter argument must be the wallet being simulated, otherwise SeaDrop
+                // evaluates a different account and the eligibility result is meaningless.
+                let clean_minter = wallet_address.trim_start_matches("0x").to_lowercase();
+                let calldata = format!("0x161ac21f{:0>64}{:0>64}{:0>64}{:0>64}", clean_nft, clean_fee, clean_minter, "1");
                 let val_hex = format!("0x{:x}", sd.mint_price_wei);
 
                 match seadrop_inspector.simulate_mint(wallet_address, SEADROP_V1_ADDRESS, &calldata, &val_hex).await {

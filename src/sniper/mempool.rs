@@ -57,6 +57,9 @@ impl MempoolScanner {
 
     /// Monitors pending transactions from the node's txpool/pending status.
     pub async fn run_scan_loop(&self, trigger_tx: mpsc::Sender<SnipeTrigger>) {
+        if self.owner_address.is_none() {
+            tracing::warn!("Mempool scanner has no owner filter: any sender calling a flip selector on the target will trigger.");
+        }
         if self.rpc_url.starts_with("ws://") || self.rpc_url.starts_with("wss://") {
             info!("Mempool scanner connecting via WebSocket streaming: {}", self.rpc_url);
             self.run_ws_loop(trigger_tx).await;
@@ -93,6 +96,15 @@ impl MempoolScanner {
                         continue;
                     }
 
+                    // Also subscribe to newHeads to stream real-time baseFeePerGas updates
+                    let sub_heads = json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "eth_subscribe",
+                        "params": ["newHeads"]
+                    });
+                    let _ = write.send(Message::Text(sub_heads.to_string().into())).await;
+
                     let client = Client::builder()
                         .timeout(Duration::from_millis(2000))
                         .build()
@@ -104,64 +116,70 @@ impl MempoolScanner {
                         match msg_res {
                             Ok(Message::Text(text)) => {
                                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                                    if let Some(tx_hash) = v.get("params")
-                                        .and_then(|p| p.get("result"))
-                                        .and_then(|r| r.as_str())
-                                    {
-                                        let sem_c = sem.clone();
-                                        let client_c = client.clone();
-                                        let http_url_c = http_url.clone();
-                                        let tx_hash_str = tx_hash.to_string();
-                                        let trigger_tx_c = trigger_tx.clone();
-                                        let selectors_c = self.selectors.clone();
-                                        let owner_addr_c = self.owner_address.clone();
-                                        let target_contract_c = self.target_contract.clone();
-
-                                        tokio::spawn(async move {
-                                            let _permit = match sem_c.acquire().await {
+                                    if let Some(params_res) = v.get("params").and_then(|p| p.get("result")) {
+                                        // Case 1: newPendingTransactions stream returns string tx_hash
+                                        if let Some(tx_hash) = params_res.as_str() {
+                                            // Bound in-flight lookups: wait for a permit before spawning.
+                                            let permit = match sem.clone().acquire_owned().await {
                                                 Ok(p) => p,
-                                                Err(_) => return,
+                                                Err(_) => break,
                                             };
-                                            let get_tx = json!({
-                                                "jsonrpc": "2.0",
-                                                "id": 1,
-                                                "method": "eth_getTransactionByHash",
-                                                "params": [tx_hash_str]
-                                            });
-                                            if let Ok(resp) = client_c.post(&http_url_c).json(&get_tx).send().await {
-                                                if let Ok(body) = resp.json::<Value>().await {
-                                                    if let Some(tx_obj) = body.get("result") {
-                                                        let sender_addr = tx_obj.get("from").and_then(|f| f.as_str()).unwrap_or("").to_lowercase();
-                                                        let to_addr = tx_obj.get("to").and_then(|t| t.as_str()).unwrap_or("").to_lowercase();
-                                                        let input_data = tx_obj.get("input").and_then(|i| i.as_str()).unwrap_or("");
+                                            let client_c = client.clone();
+                                            let http_url_c = http_url.clone();
+                                            let tx_hash_str = tx_hash.to_string();
+                                            let trigger_tx_c = trigger_tx.clone();
+                                            let selectors_c = self.selectors.clone();
+                                            let owner_addr_c = self.owner_address.clone();
+                                            let target_contract_c = self.target_contract.clone();
 
-                                                        let is_owner_match = owner_addr_c.as_ref().is_none_or(|o| *o == sender_addr);
-                                                        let target_matches = to_addr == target_contract_c;
-                                                        let clean = input_data.trim_start_matches("0x");
-                                                        let selector_matches = if clean.len() >= 8 {
-                                                            if let Ok(bytes) = hex::decode(&clean[0..8]) {
-                                                                selectors_c.iter().any(|s| s == bytes.as_slice())
+                                            tokio::spawn(async move {
+                                                let _permit = permit;
+                                                let get_tx = json!({
+                                                    "jsonrpc": "2.0",
+                                                    "id": 1,
+                                                    "method": "eth_getTransactionByHash",
+                                                    "params": [tx_hash_str]
+                                                });
+                                                if let Ok(resp) = client_c.post(&http_url_c).json(&get_tx).send().await {
+                                                    if let Ok(body) = resp.json::<Value>().await {
+                                                        if let Some(tx_obj) = body.get("result") {
+                                                            let sender_addr = tx_obj.get("from").and_then(|f| f.as_str()).unwrap_or("").to_lowercase();
+                                                            let to_addr = tx_obj.get("to").and_then(|t| t.as_str()).unwrap_or("").to_lowercase();
+                                                            let input_data = tx_obj.get("input").and_then(|i| i.as_str()).unwrap_or("");
+
+                                                            let is_owner_match = owner_addr_c.as_ref().is_none_or(|o| *o == sender_addr);
+                                                            let target_matches = to_addr == target_contract_c;
+                                                            let clean = input_data.trim_start_matches("0x");
+                                                            let selector_matches = if clean.len() >= 8 {
+                                                                if let Ok(bytes) = hex::decode(&clean[0..8]) {
+                                                                    selectors_c.iter().any(|s| s == bytes.as_slice())
+                                                                } else {
+                                                                    false
+                                                                }
                                                             } else {
                                                                 false
-                                                            }
-                                                        } else {
-                                                            false
-                                                        };
+                                                            };
 
-                                                        if is_owner_match && target_matches && selector_matches {
-                                                            info!(
-                                                                "WS Mempool sniper detected matching trigger tx: {} from {} to {}",
-                                                                tx_hash_str, sender_addr, to_addr
-                                                            );
-                                                            let _ = trigger_tx_c.send(SnipeTrigger::MempoolDetected {
-                                                                owner_tx_hash: tx_hash_str,
-                                                                method: input_data.chars().take(10).collect(),
-                                                            }).await;
+                                                            if is_owner_match && target_matches && selector_matches {
+                                                                info!(
+                                                                    "WS Mempool sniper detected matching trigger tx: {} from {} to {}",
+                                                                    tx_hash_str, sender_addr, to_addr
+                                                                );
+                                                                let _ = trigger_tx_c.send(SnipeTrigger::MempoolDetected {
+                                                                    owner_tx_hash: tx_hash_str,
+                                                                    method: input_data.chars().take(10).collect(),
+                                                                }).await;
+                                                            }
                                                         }
                                                     }
                                                 }
+                                            });
+                                        } else if let Some(base_fee_hex) = params_res.get("baseFeePerGas").and_then(|b| b.as_str()) {
+                                            // Case 2: newHeads stream returns block header object with baseFeePerGas
+                                            if let Ok(base_fee_wei) = u128::from_str_radix(base_fee_hex.trim_start_matches("0x"), 16) {
+                                                let _ = trigger_tx.send(SnipeTrigger::BaseFeeUpdated { base_fee_wei }).await;
                                             }
-                                        });
+                                        }
                                     }
                                 }
                             }

@@ -58,12 +58,17 @@ impl SeaDropInspector {
         let clean = nft_contract.trim().trim_start_matches("0x").to_lowercase();
         let calldata = format!("0x68632274{:0>64}", clean);
         let res = self.eth_call(SEADROP_V1_ADDRESS, &calldata, "0x0").await.ok()?;
+        // ABI: address[] is dynamic. Word 0 = offset, word at offset = length, then elements.
         let hex_res = res.trim_start_matches("0x");
-        if hex_res.len() >= 192 {
-            let addr_hex = &hex_res[hex_res.len() - 40..];
-            return Some(format!("0x{addr_hex}"));
+        let word = |i: usize| -> Option<&str> { hex_res.get(i * 64..(i + 1) * 64) };
+        let offset_bytes = usize::from_str_radix(word(0)?, 16).ok()?;
+        let len_word = offset_bytes / 32;
+        let count = usize::from_str_radix(word(len_word)?, 16).ok()?;
+        if count == 0 {
+            return None;
         }
-        None
+        let first = word(len_word + 1)?;
+        Some(format!("0x{}", &first[24..]))
     }
 
     /// Queries getMintStats(address minter) on the NFT contract.
@@ -175,12 +180,10 @@ pub fn decode_revert_reason(data: &str, fallback_msg: &str) -> String {
             "8baa579f" => return "Invalid Server-Side Signature (InvalidSignature)".to_string(),
             "5e548816" => return "Fee Recipient Not Allowed (FeeRecipientNotAllowed)".to_string(),
             "4e487b71" => return "Panic / Integer Overflow (Panic)".to_string(),
-            "08c379a0" if clean.len() >= 136 => {
-                // Standard Error(string)
-                if let Ok(bytes) = hex::decode(&clean[136..]) {
-                    if let Ok(s) = String::from_utf8(bytes) {
-                        return s.trim_matches(char::from(0)).to_string();
-                    }
+            "08c379a0" => {
+                // Standard Error(string): selector, offset word, length word, then UTF-8 bytes.
+                if let Some(reason) = decode_error_string(&clean[8..]) {
+                    return reason;
                 }
             }
             _ => {}
@@ -189,9 +192,32 @@ pub fn decode_revert_reason(data: &str, fallback_msg: &str) -> String {
     fallback_msg.to_string()
 }
 
+/// Decodes the ABI payload of Error(string). `payload` excludes the selector.
+fn decode_error_string(payload: &str) -> Option<String> {
+    let word = |i: usize| payload.get(i * 64..(i + 1) * 64);
+    let offset = usize::from_str_radix(word(0)?, 16).ok()?;
+    let len_pos = offset / 32;
+    let len = usize::from_str_radix(word(len_pos)?, 16).ok()?;
+    let start = (len_pos + 1) * 64;
+    let bytes = hex::decode(payload.get(start..start + len * 2)?).ok()?;
+    String::from_utf8(bytes).ok().map(|s| s.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_decode_error_string_abi() {
+        // Error("Mint closed") encoded per ABI.
+        let msg = "Mint closed";
+        let mut payload = String::new();
+        payload.push_str(&format!("{:064x}", 32));
+        payload.push_str(&format!("{:064x}", msg.len()));
+        payload.push_str(&format!("{:0<64}", hex::encode(msg)));
+        let data = format!("0x08c379a0{payload}");
+        assert_eq!(decode_revert_reason(&data, "revert"), "Mint closed");
+    }
 
     #[test]
     fn test_decode_seadrop_revert_reasons() {

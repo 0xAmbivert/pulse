@@ -5,3 +5,5 @@ config.toml
 SECURITY_AUDIT_REPORT.md
 *audit*
 *report*.md
+
+PULSE_AUDIT_AND_HANDOFF.md

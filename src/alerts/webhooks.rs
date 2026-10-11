@@ -21,6 +21,11 @@ impl AlertDispatcher {
             .build()
             .unwrap_or_else(|_| Client::new());
 
+        // Allow fallback to environment variables so webhook secrets need not be written to disk config
+        let discord_webhook = discord_webhook.or_else(|| std::env::var("DISCORD_WEBHOOK").ok());
+        let telegram_token = telegram_token.or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok());
+        let telegram_chat_id = telegram_chat_id.or_else(|| std::env::var("TELEGRAM_CHAT_ID").ok());
+
         Self {
             client,
             discord_webhook,
@@ -42,22 +47,23 @@ impl AlertDispatcher {
                 }]
             });
 
+            // `without_url()` keeps webhook URLs (which carry secrets) out of logs.
             if let Err(e) = self.client.post(discord_url).json(&payload).send().await {
-                warn!("Failed to dispatch Discord alert: {e}");
+                warn!("Failed to dispatch Discord alert: {}", e.without_url());
             }
         }
 
         if let (Some(ref token), Some(ref chat_id)) = (&self.telegram_token, &self.telegram_chat_id) {
             let tg_url = format!("https://api.telegram.org/bot{token}/sendMessage");
-            let text = format!("*{title}*\n\n{message}");
+            // Plain text (no parse_mode) so user-controlled content cannot break formatting.
+            let text = format!("{title}\n\n{message}");
             let payload = json!({
                 "chat_id": chat_id,
                 "text": text,
-                "parse_mode": "Markdown"
             });
 
             if let Err(e) = self.client.post(&tg_url).json(&payload).send().await {
-                warn!("Failed to dispatch Telegram alert: {e}");
+                warn!("Failed to dispatch Telegram alert: {}", e.without_url());
             }
         }
     }

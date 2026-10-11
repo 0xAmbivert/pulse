@@ -35,17 +35,21 @@ impl RpcSimulator {
         target_contract: &str,
         calldata: &[u8],
         value_wei: u128,
-        _gas_limit: u64,
+        gas_limit: u64,
     ) -> Result<SimResult, Box<dyn std::error::Error + Send + Sync>> {
+        let mut tx_obj = json!({
+            "from": caller,
+            "to": target_contract,
+            "data": format!("0x{}", hex::encode(calldata)),
+            "value": format!("0x{:x}", value_wei),
+        });
+        if gas_limit > 0 {
+            tx_obj["gas"] = json!(format!("0x{:x}", gas_limit));
+        }
         let payload = json!({
             "jsonrpc": "2.0",
             "method": "eth_estimateGas",
-            "params": [{
-                "from": caller,
-                "to": target_contract,
-                "data": format!("0x{}", hex::encode(calldata)),
-                "value": format!("0x{:x}", value_wei)
-            }, "latest"],
+            "params": [tx_obj, "latest"],
             "id": 1
         });
 

@@ -13,6 +13,33 @@ pub enum MenuAction {
     Exit,
 }
 
+/// Reads one line from stdin. Returns `None` on EOF so callers can exit instead of looping.
+fn read_line_opt() -> io::Result<Option<String>> {
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line))
+}
+
+/// Reads a private key without echo on a TTY. Non-TTY input is refused unless
+/// `PULSE_ALLOW_PIPED_KEY=1` is set, to avoid echoing keys into logs or shells.
+fn read_private_key(prompt: &str) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    if io::stdin().is_terminal() {
+        return Ok(Some(rpassword::prompt_password(prompt)?));
+    }
+    if std::env::var("PULSE_ALLOW_PIPED_KEY").as_deref() != Ok("1") {
+        return Err("Refusing to read a private key from non-interactive stdin. Set PULSE_ALLOW_PIPED_KEY=1 to override.".into());
+    }
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line.trim().to_string()))
+}
+
 /// Displays the interactive CLI menu and returns the ephemeral session configuration.
 pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction, Box<dyn std::error::Error + Send + Sync>> {
     loop {
@@ -25,10 +52,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
         print!("👉 Choose an option: ");
         io::stdout().flush()?;
 
-        let mut choice = String::new();
-        if io::stdin().read_line(&mut choice)? == 0 {
+        let Some(choice) = read_line_opt()? else {
             return Ok(MenuAction::Exit);
-        }
+        };
 
         match choice.trim() {
             "1" => {
@@ -36,22 +62,13 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 println!("🔒 Everything entered here lives only in RAM for this active session and is wiped on exit.\n");
 
                 // 1. Private Key (RAM only, hidden input via rpassword when interactive, stdin when piped)
-                let pk_input = if io::stdin().is_terminal() {
-                    match rpassword::prompt_password("1️⃣  Paste raw private key (Hex): ") {
-                        Ok(p) => p,
-                        Err(e) => {
-                            println!("❌ Failed to read private key: {}", e);
-                            continue;
-                        }
+                let pk_input = match read_private_key("1️⃣  Paste raw private key (Hex): ") {
+                    Ok(Some(p)) => p,
+                    Ok(None) => return Ok(MenuAction::Exit),
+                    Err(e) => {
+                        println!("❌ Failed to read private key: {}", e);
+                        continue;
                     }
-                } else {
-                    print!("1️⃣  Paste raw private key (Hex): ");
-                    io::stdout().flush()?;
-                    let mut line = String::new();
-                    if io::stdin().read_line(&mut line)? == 0 {
-                        return Ok(MenuAction::Exit);
-                    }
-                    line.trim().to_string()
                 };
                 let pk_guard = zeroize::Zeroizing::new(pk_input);
                 let clean_hex = pk_guard.as_str().trim().trim_start_matches("0x");
@@ -72,8 +89,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 // 2. Target Contract Address or OpenSea URL
                 print!("2️⃣  Enter Target NFT Contract Address or OpenSea URL: ");
                 io::stdout().flush()?;
-                let mut target = String::new();
-                io::stdin().read_line(&mut target)?;
+                let Some(target) = read_line_opt()? else {
+                    return Ok(MenuAction::Exit);
+                };
                 let target_input = target.trim().to_string();
                 if target_input.is_empty() {
                     println!("❌ Target contract address cannot be empty.");
@@ -106,8 +124,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 let default_rpcs = base_config.chain.rpc_urls.join(", ");
                 print!("3️⃣  Enter RPC URLs (comma-separated, or Press Enter to keep '{}'): ", default_rpcs);
                 io::stdout().flush()?;
-                let mut rpc_input = String::new();
-                io::stdin().read_line(&mut rpc_input)?;
+                let Some(rpc_input) = read_line_opt()? else {
+                    return Ok(MenuAction::Exit);
+                };
                 let rpc_urls: Vec<String> = if rpc_input.trim().is_empty() {
                     base_config.chain.rpc_urls.clone()
                 } else {
@@ -132,8 +151,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 let default_mint_func = detected_mint_func.unwrap_or_else(|| base_config.drop.mint_function.clone());
                 print!("4️⃣  Enter Mint Function (Press Enter for '{}'): ", default_mint_func);
                 io::stdout().flush()?;
-                let mut mint_sig = String::new();
-                io::stdin().read_line(&mut mint_sig)?;
+                let Some(mint_sig) = read_line_opt()? else {
+                    return Ok(MenuAction::Exit);
+                };
                 let mint_function = if mint_sig.trim().is_empty() {
                     default_mint_func
                 } else {
@@ -144,8 +164,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 let default_val_wei = detected_price_wei.unwrap_or_else(|| base_config.drop.mint_value_wei.clone());
                 print!("5️⃣  Enter Mint Value in Wei (Press Enter for '{}'): ", default_val_wei);
                 io::stdout().flush()?;
-                let mut val_input = String::new();
-                io::stdin().read_line(&mut val_input)?;
+                let Some(val_input) = read_line_opt()? else {
+                    return Ok(MenuAction::Exit);
+                };
                 let mint_value_wei = if val_input.trim().is_empty() {
                     default_val_wei
                 } else {
@@ -155,8 +176,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 // 6. Max Gas Fee in Gwei (Optional: Enter for default)
                 print!("6️⃣  Enter Max Gas Fee in Gwei (Press Enter for '{:.1}'): ", base_config.gas.max_fee_gwei);
                 io::stdout().flush()?;
-                let mut gas_input = String::new();
-                io::stdin().read_line(&mut gas_input)?;
+                let Some(gas_input) = read_line_opt()? else {
+                    return Ok(MenuAction::Exit);
+                };
                 let max_gas_fee = if gas_input.trim().is_empty() {
                     base_config.gas.max_fee_gwei
                 } else {
@@ -170,8 +192,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 println!("   c) Mempool Backrun (Watches owner transaction)");
                 print!("👉 Choose trigger mode [a/b/c] (default 'a'): ");
                 io::stdout().flush()?;
-                let mut trigger_choice = String::new();
-                io::stdin().read_line(&mut trigger_choice)?;
+                let Some(trigger_choice) = read_line_opt()? else {
+                    return Ok(MenuAction::Exit);
+                };
 
                 let mut target_timestamp = None;
                 let mut monitor_owner_address = None;
@@ -180,15 +203,17 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                     "b" => {
                         print!("   Enter Target Unix Timestamp: ");
                         io::stdout().flush()?;
-                        let mut ts_str = String::new();
-                        io::stdin().read_line(&mut ts_str)?;
+                        let Some(ts_str) = read_line_opt()? else {
+                            return Ok(MenuAction::Exit);
+                        };
                         target_timestamp = ts_str.trim().parse::<u64>().ok();
                     }
                     "c" => {
                         print!("   Enter Owner Address to Monitor: ");
                         io::stdout().flush()?;
-                        let mut owner_str = String::new();
-                        io::stdin().read_line(&mut owner_str)?;
+                        let Some(owner_str) = read_line_opt()? else {
+                            return Ok(MenuAction::Exit);
+                        };
                         if !owner_str.trim().is_empty() {
                             monitor_owner_address = Some(owner_str.trim().to_string());
                         }
@@ -215,8 +240,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 println!("\n--- 🔍 Mint & Wallet Eligibility Checker ---");
                 print!("🎯 Enter Contract Address or OpenSea URL (e.g. https://opensea.io/collection/housecraft or 0x...): ");
                 io::stdout().flush()?;
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
+                let Some(input) = read_line_opt()? else {
+                    return Ok(MenuAction::Exit);
+                };
                 let target_input = input.trim().to_string();
                 if target_input.is_empty() {
                     println!("❌ Input cannot be empty.");
@@ -225,8 +251,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
 
                 print!("👛 Enter Wallet Address to check eligibility against (0x...): ");
                 io::stdout().flush()?;
-                let mut wallet_in = String::new();
-                io::stdin().read_line(&mut wallet_in)?;
+                let Some(wallet_in) = read_line_opt()? else {
+                    return Ok(MenuAction::Exit);
+                };
                 let wallet_addr = wallet_in.trim().to_string();
                 if wallet_addr.len() != 42 || !wallet_addr.starts_with("0x") {
                     println!("❌ Invalid wallet address. Must be a 42-character 0x address.");
@@ -236,8 +263,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 let default_rpc = base_config.chain.rpc_urls.first().cloned().unwrap_or_else(|| "https://rpc.mainnet.chain.robinhood.com".to_string());
                 print!("🌐 Enter RPC URL (Press Enter for '{}'): ", default_rpc);
                 io::stdout().flush()?;
-                let mut rpc_in = String::new();
-                io::stdin().read_line(&mut rpc_in)?;
+                let Some(rpc_in) = read_line_opt()? else {
+                    return Ok(MenuAction::Exit);
+                };
                 let rpc_url = if rpc_in.trim().is_empty() { default_rpc } else { rpc_in.trim().to_string() };
 
                 println!("\n⏳ Querying OpenSea API, MintGo intelligence, and live on-chain contract state...");
@@ -253,16 +281,18 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
 
                         print!("👉 Would you like to load this contract into the Sniper now? [y/N]: ");
                         io::stdout().flush()?;
-                        let mut launch_in = String::new();
-                        io::stdin().read_line(&mut launch_in)?;
+                        let Some(launch_in) = read_line_opt()? else {
+                            return Ok(MenuAction::Exit);
+                        };
                         if launch_in.trim().eq_ignore_ascii_case("y") {
                             println!("\n🔒 Paste your raw private key (Hex) to arm RAM sniper:");
-                            let pk_input = if io::stdin().is_terminal() {
-                                rpassword::prompt_password("1️⃣  Paste raw private key (Hex): ").unwrap_or_default()
-                            } else {
-                                let mut l = String::new();
-                                let _ = io::stdin().read_line(&mut l);
-                                l.trim().to_string()
+                            let pk_input = match read_private_key("1️⃣  Paste raw private key (Hex): ") {
+                                Ok(Some(p)) => p,
+                                Ok(None) => return Ok(MenuAction::Exit),
+                                Err(e) => {
+                                    println!("❌ Failed to read private key: {}. Returning to menu.", e);
+                                    continue;
+                                }
                             };
                             let pk_guard = zeroize::Zeroizing::new(pk_input);
                             let clean_hex = pk_guard.as_str().trim().trim_start_matches("0x");

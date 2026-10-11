@@ -41,10 +41,10 @@
 
 | Feature | The Guarantee | How Pulse Delivers |
 | :--- | :--- | :--- |
-| **Zero Disk Footprint** | Keys never touch disk, swap, or files | `mlock`-pinned heap buffer + `zeroize` on drop; zero keystore files on disk |
+| **No Keystore Files** | Keys are never written by Pulse | Key is read into a dedicated `mmap` page, `mlock`ed (fail-closed), `MADV_DONTDUMP`, and zeroized on drop; no keystore files are created |
 | **Zero Web Dependencies** | Immune to OpenSea / MintGo website crashes | Mint transactions route directly to on-chain smart contracts via RPC/MEV sockets |
-| **Sub-Millisecond Dispatch** | $<1\text{ms}$ socket transmission on trigger hit | EIP-1559 transactions are pre-constructed and pre-signed in memory ahead of the drop |
-| **Chain-Aware Relaying** | Zero MEV builder rejections on L2 networks | Concurrently broadcasts to builders + public RPC on L1; routes directly to RPC racers on L2 |
+| **Low-Latency Dispatch** | Minimal work on the trigger path | EIP-1559 transactions are pre-constructed and pre-signed in memory ahead of the drop; latency is measured, not guaranteed |
+| **Chain-Aware Relaying** | L1 private-builder first; L2 public RPC only | On L1, builders are tried first and public RPC is used only if builders reject; on L2, RPC racers only |
 | **Hard Gas Guardrails** | Never overpay in a spike | Enforces hard gas fee ceilings; aborts instead of substituting static fallback fees |
 | **Replace-By-Fee (RBF)** | Never stuck in pending status | Background monitor polls receipts; automatically bumps gas fees and re-broadcasts |
 
@@ -65,12 +65,14 @@ Unlike conventional bots that persist password-encrypted keystores (`.json` file
 
 ### Why RAM-Only Isolation is Superior
 1. **Elimination of At-Rest Attacks**: Even AES-256 encrypted keystores on disk are susceptible to offline brute-force attacks if a dictionary passphrase was used, or if disk backups and git commits are inspected. By keeping keys exclusively in volatile RAM, there is zero forensic residue left on the drive.
-2. **Kernel Swap & Pagefile Immunity**: Pulse invokes POSIX `libc::mlock` on allocation. The operating system kernel is forbidden from paging or swapping private key bytes to disk or swap partitions.
+2. **Swap Hardening (best effort)**: Pulse calls `mlock` on the key page so it should not be paged out. If `mlock` fails, Pulse refuses to start unless `PULSE_ALLOW_UNLOCKED_KEY=1` is set. Swap is not guaranteed to be disabled; use encrypted swap or no swap for stronger guarantees.
 3. **No Passwords to Remember or Crack**: You do not need to create, manage, or decrypt master passphrases. You paste your raw key once when arming the engine.
 4. **Deterministic Anti-Forensic Scrubbing**:
    - `ProtectedKey` implements Rust's `Zeroize` trait.
-   - When dropped, the memory buffer is overwritten with zeroes **before** releasing the memory lock (`munlock`).
-   - Signal handlers for `SIGTERM`, `SIGHUP`, and `Ctrl-C` gracefully intercept termination, ensuring `Drop` runs reliably even if killed by process managers.
+   - When dropped, the memory buffer is overwritten with zeroes **before** releasing the memory lock (`munlock`) and unmapping.
+   - Signal handlers for `SIGTERM`, `SIGHUP`, and `Ctrl-C` trigger a clean shutdown. `SIGKILL` cannot be intercepted, so `Drop` does not run in that case and the OS reclaims the memory.
+   - At startup, Pulse disables core dumps (`RLIMIT_CORE=0`) and marks the process non-dumpable (`PR_SET_DUMPABLE=0`) on Linux.
+   - Piped (non-TTY) key input is refused unless `PULSE_ALLOW_PIPED_KEY=1` is set.
 
 ---
 
@@ -104,7 +106,7 @@ cd pulse
 cargo build --release
 ```
 
-The resulting binary (`./target/release/pulse`) is statically linked, stripped of debug symbols, and optimized with link-time optimization (`lto = "thin"`).
+The resulting binary (`./target/release/pulse`) is dynamically linked against glibc, stripped of debug symbols, and optimized with link-time optimization (`lto = "thin"`).
 
 ---
 
@@ -222,7 +224,7 @@ Pulse provides three high-precision triggering mechanisms:
 
 1. **Pre-Signed Transaction Cache:** Transactions are constructed and signed in memory *ahead of time*. When the trigger condition is met, Pulse doesn't spend time signing or calculating gas—it transmits the raw pre-signed bytes directly to open sockets.
 2. **Chain-Aware Dual-Broadcasting:**
-   - **Ethereum L1 (`chain_id == 1`):** Concurrently transmits to direct private MEV builders (`eth_sendPrivateTransaction` with EIP-191 authentication) and races public RPCs.
+   - **Ethereum L1 (`chain_id == 1`):** Sends to private MEV builders first (`eth_sendPrivateTransaction` with EIP-191 authentication). Public RPCs are used only if every builder rejects the transaction, so the transaction is not leaked to the public mempool when a builder accepts it.
    - **EVM L2s (Robinhood `4663`, Base `8453`, Arbitrum `42161`):** Bypasses L1 builder relays and floods parallel public RPC endpoints simultaneously to guarantee inclusion by the sequencer.
 3. **Keep-Alive Socket Warming:** Sockets are pre-warmed every 15–30 seconds with keep-alive pings, eliminating cold TCP/TLS handshake latency during the critical drop second.
 4. **Replace-by-Fee (RBF) Auto-Speedup:** If a transaction remains unconfirmed after `speedup_threshold_ms`, Pulse calculates bumped gas fees (`+15%`), re-signs the same nonce, and re-broadcasts until confirmed or the hard ceiling is reached.
