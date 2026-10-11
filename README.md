@@ -206,7 +206,7 @@ Pulse provides three high-precision triggering mechanisms:
 ### C. Mempool Backrun (Reactive Transaction Sniping)
 * **Best For:** Frontrunning the public or backrunning the creator's flip transaction.
 * **Dual Transport:**
-  - **WebSocket Streaming (`wss://`):** Subscribes to `newPendingTransactions` via `eth_subscribe` and streams pending transaction details reactively as they hit the mempool.
+  - **WebSocket Streaming (`wss://`):** Subscribes to `newPendingTransactions` to stream pending transaction details reactively as they hit the mempool, alongside `newHeads` for instantaneous block base-fee tracking.
   - **HTTP Polling:** Fallback polling of `eth_getBlockByNumber("pending", true)`.
 * **Anti-Spoof Matching:** Requires a strict three-point match (Sender == Owner Address, To == Target Contract, Calldata Selector == Flip Function) before triggering.
 
@@ -226,8 +226,9 @@ Pulse provides three high-precision triggering mechanisms:
 2. **Chain-Aware Dual-Broadcasting:**
    - **Ethereum L1 (`chain_id == 1`):** Sends to private MEV builders first (`eth_sendPrivateTransaction` with EIP-191 authentication). Public RPCs are used only if every builder rejects the transaction, so the transaction is not leaked to the public mempool when a builder accepts it.
    - **EVM L2s (Robinhood `4663`, Base `8453`, Arbitrum `42161`):** Bypasses L1 builder relays and floods parallel public RPC endpoints simultaneously to guarantee inclusion by the sequencer.
-3. **Keep-Alive Socket Warming:** Sockets are pre-warmed every 15–30 seconds with keep-alive pings, eliminating cold TCP/TLS handshake latency during the critical drop second.
-4. **Replace-by-Fee (RBF) Auto-Speedup:** If a transaction remains unconfirmed after `speedup_threshold_ms`, Pulse calculates bumped gas fees (`+15%`), re-signs the same nonce, and re-broadcasts until confirmed or the hard ceiling is reached.
+3. **Keep-Alive Socket Warming & Telemetry:** Sockets are pre-warmed with decoupled background keep-alive pings, eliminating cold TCP/TLS handshake latency during the critical drop second without blocking the TUI event loop.
+4. **Nonce Gap Auto-Advancing:** Nonce manager tracks on-chain pending counts and automatically resynchronizes forward if network transactions have outpaced local counters, preventing 'nonce too low' rejects.
+5. **Replace-by-Fee (RBF) Auto-Speedup:** If a transaction remains unconfirmed after `speedup_threshold_ms`, Pulse calculates bumped gas fees (`+15%`), re-signs the same nonce, and re-broadcasts until confirmed, the hard ceiling is reached, or the 600s abandon window elapses.
 
 ---
 
@@ -268,6 +269,8 @@ discord_webhook = ""
 telegram_bot_token = ""
 telegram_chat_id = ""
 ```
+
+> 💡 **Webhook Secrets via Environment Variables**: You can supply `DISCORD_WEBHOOK`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` as environment variables instead of writing them to `config.toml`. All internal logs are written to `/tmp/pulse.log` so secrets are never printed to the TUI.
 
 ---
 
