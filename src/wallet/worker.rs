@@ -42,6 +42,7 @@ impl WalletWorker {
         explicit_nonce: Option<u64>,
     ) -> Result<(String, u64), Box<dyn std::error::Error + Send + Sync>> {
         let target_addr = Address::from_str(to_address)?;
+        let reserved = explicit_nonce.is_none();
         let nonce = explicit_nonce.unwrap_or_else(|| self.nonce_mgr.get_and_increment());
 
         let tx = TxEip1559 {
@@ -58,9 +59,18 @@ impl WalletWorker {
 
         // Compute EIP-1559 signature hash
         let sighash = tx.signature_hash();
-        let signer = create_signer_from_protected(&self.key)?;
-        let signature = signer.sign_hash_sync(&sighash)?;
-        drop(signer); // Wipe unpinned signer scalar immediately
+        let signed = create_signer_from_protected(&self.key)
+            .and_then(|s| s.sign_hash_sync(&sighash).map_err(Into::into));
+        let signature = match signed {
+            Ok(sig) => sig,
+            Err(e) => {
+                // Return the reserved nonce so a sign failure cannot leave a gap.
+                if reserved {
+                    self.nonce_mgr.release(nonce);
+                }
+                return Err(e);
+            }
+        };
         let signed_tx = tx.into_signed(signature);
 
         // Encode into standard EIP-2718 typed transaction payload

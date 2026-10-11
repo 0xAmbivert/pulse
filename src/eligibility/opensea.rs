@@ -38,14 +38,25 @@ impl OpenSeaClient {
         None
     }
 
+    /// Builds a GET request, attaching `X-API-KEY` from `OPENSEA_API_KEY` when set.
+    fn get(&self, url: &str) -> reqwest::RequestBuilder {
+        let req = self.client.get(url).header("Accept", "application/json");
+        match std::env::var("OPENSEA_API_KEY") {
+            Ok(key) if !key.trim().is_empty() => req.header("X-API-KEY", key.trim()),
+            _ => req,
+        }
+    }
+
     /// Resolves an OpenSea collection by slug using OpenSea API v2.
     pub async fn fetch_collection_by_slug(&self, slug: &str) -> Result<ResolvedDropTarget, String> {
         let url = format!("https://api.opensea.io/api/v2/collections/{slug}");
-        let resp = self.client.get(&url)
-            .header("Accept", "application/json")
+        let resp = self.get(&url)
             .send().await
             .map_err(|e| format!("OpenSea API connection error: {e}"))?;
 
+        if resp.status().as_u16() == 401 {
+            return Err("OpenSea returned HTTP 401. Set OPENSEA_API_KEY to a valid key.".to_string());
+        }
         if !resp.status().is_success() {
             return Err(format!("OpenSea collection '{}' not found (HTTP {})", slug, resp.status()));
         }
@@ -74,7 +85,7 @@ impl OpenSeaClient {
             .and_then(|c| c.as_str())
             .unwrap_or("ethereum");
 
-        let chain_id = chain_slug_to_id(chain_str);
+        let chain_id = chain_slug_to_id(chain_str)?;
 
         let fee_recipient = body.get("fees")
             .and_then(|f| f.as_array())
@@ -97,8 +108,7 @@ impl OpenSeaClient {
     /// Resolves an OpenSea collection by contract address and chain.
     pub async fn fetch_collection_by_contract(&self, chain: &str, contract: &str) -> Result<ResolvedDropTarget, String> {
         let url = format!("https://api.opensea.io/api/v2/chain/{chain}/contract/{contract}");
-        let resp = self.client.get(&url)
-            .header("Accept", "application/json")
+        let resp = self.get(&url)
             .send().await
             .map_err(|e| format!("OpenSea API connection error: {e}"))?;
 
@@ -132,36 +142,38 @@ impl OpenSeaClient {
             collection_name: name,
             collection_slug: slug,
             chain: chain.to_string(),
-            chain_id: chain_slug_to_id(chain),
+            chain_id: chain_slug_to_id(chain)?,
             opensea_url,
             fee_recipient,
         })
     }
 }
 
-pub fn chain_slug_to_id(chain: &str) -> u64 {
+/// Maps an OpenSea chain slug to a chain ID. Unknown slugs are an error, never a silent default.
+pub fn chain_slug_to_id(chain: &str) -> Result<u64, String> {
     match chain.to_lowercase().as_str() {
-        "robinhood" => 4663,
-        "ethereum" | "eth" | "mainnet" => 1,
-        "base" => 8453,
-        "arbitrum" | "arbitrum_one" => 42161,
-        "polygon" | "matic" => 137,
-        "optimism" => 10,
-        "sepolia" => 11155111,
-        _ => 1,
+        "robinhood" => Ok(4663),
+        "ethereum" | "eth" | "mainnet" => Ok(1),
+        "base" => Ok(8453),
+        "arbitrum" | "arbitrum_one" => Ok(42161),
+        "polygon" | "matic" => Ok(137),
+        "optimism" => Ok(10),
+        "sepolia" => Ok(11155111),
+        other => Err(format!("Unsupported chain slug '{other}'")),
     }
 }
 
-pub fn chain_id_to_slug(chain_id: u64) -> &'static str {
+/// Maps a chain ID to an OpenSea chain slug. Unknown IDs are an error.
+pub fn chain_id_to_slug(chain_id: u64) -> Result<&'static str, String> {
     match chain_id {
-        4663 => "robinhood",
-        1 => "ethereum",
-        8453 => "base",
-        42161 => "arbitrum",
-        137 => "polygon",
-        10 => "optimism",
-        11155111 => "sepolia",
-        _ => "ethereum",
+        4663 => Ok("robinhood"),
+        1 => Ok("ethereum"),
+        8453 => Ok("base"),
+        42161 => Ok("arbitrum"),
+        137 => Ok("polygon"),
+        10 => Ok("optimism"),
+        11155111 => Ok("sepolia"),
+        other => Err(format!("Unsupported chain ID {other}")),
     }
 }
 
@@ -191,8 +203,10 @@ mod tests {
 
     #[test]
     fn test_chain_mapping() {
-        assert_eq!(chain_slug_to_id("robinhood"), 4663);
-        assert_eq!(chain_slug_to_id("base"), 8453);
-        assert_eq!(chain_id_to_slug(4663), "robinhood");
+        assert_eq!(chain_slug_to_id("robinhood"), Ok(4663));
+        assert_eq!(chain_slug_to_id("base"), Ok(8453));
+        assert_eq!(chain_id_to_slug(4663), Ok("robinhood"));
+        assert!(chain_slug_to_id("made-up").is_err());
+        assert!(chain_id_to_slug(999_999).is_err());
     }
 }

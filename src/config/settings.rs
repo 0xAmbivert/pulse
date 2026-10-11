@@ -55,6 +55,13 @@ impl Default for DropConfig {
     }
 }
 
+/// ABI-encodes a u64 as a big-endian 32-byte word.
+fn u256_word(value: u64) -> [u8; 32] {
+    let mut word = [0u8; 32];
+    word[24..32].copy_from_slice(&value.to_be_bytes());
+    word
+}
+
 /// ABI-encodes an address as a 32-byte word. Missing or malformed callers are errors.
 fn encode_address_word(caller: Option<&str>) -> Result<[u8; 32], String> {
     let c = caller.ok_or_else(|| "Mint function requires a caller address".to_string())?;
@@ -67,10 +74,11 @@ fn encode_address_word(caller: Option<&str>) -> Result<[u8; 32], String> {
 
 impl DropConfig {
     pub fn build_calldata(&self) -> Result<Vec<u8>, String> {
-        self.build_calldata_for_caller(None)
+        self.build_calldata_for_caller(None, 1)
     }
 
-    pub fn build_calldata_for_caller(&self, caller: Option<&str>) -> Result<Vec<u8>, String> {
+    /// Builds calldata for `mint(...)`-style signatures. `quantity` is written to any `uint256` argument.
+    pub fn build_calldata_for_caller(&self, caller: Option<&str>, quantity: u64) -> Result<Vec<u8>, String> {
         if let Some(ref hex_str) = self.custom_calldata_hex {
             let clean = hex_str.trim().trim_start_matches("0x");
             if !clean.is_empty() {
@@ -96,17 +104,13 @@ impl DropConfig {
         if func_sig.contains("address,uint256") {
             let addr_bytes = encode_address_word(caller)?;
             data.extend_from_slice(&addr_bytes);
-            let mut amount = [0u8; 32];
-            amount[31] = 1;
-            data.extend_from_slice(&amount);
+            data.extend_from_slice(&u256_word(quantity));
             return Ok(data);
         }
 
         // Quantity mints: mint(uint256)
         if func_sig.contains("uint256") && !func_sig.contains("address") {
-            let mut amount = [0u8; 32];
-            amount[31] = 1;
-            data.extend_from_slice(&amount);
+            data.extend_from_slice(&u256_word(quantity));
             return Ok(data);
         }
 
@@ -303,6 +307,8 @@ mod tests {
         let calldata = drop.build_calldata().unwrap();
         assert_eq!(calldata.len(), 36);
         assert_eq!(calldata[35], 1);
+        let calldata = drop.build_calldata_for_caller(None, 3).unwrap();
+        assert_eq!(calldata[35], 3);
     }
 
     #[test]
@@ -312,7 +318,7 @@ mod tests {
             ..Default::default()
         };
         let caller = "0x1111111111111111111111111111111111111111";
-        let calldata = drop.build_calldata_for_caller(Some(caller)).unwrap();
+        let calldata = drop.build_calldata_for_caller(Some(caller), 1).unwrap();
         assert_eq!(calldata.len(), 4 + 32 + 32);
         assert_eq!(calldata[67], 1); // quantity 1 at end of second 32-byte word
     }

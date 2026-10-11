@@ -9,18 +9,21 @@ use tracing::info;
 pub struct StatePoller {
     rpc_url: String,
     target_contract: String,
-    calldata_hex: String,
+    calldata_hex: Vec<String>,
 }
 
 impl StatePoller {
-    pub fn new(rpc_url: &str, target_contract: &str, state_check_func_sig: &str) -> Self {
-        let hash = keccak256(state_check_func_sig.as_bytes());
-        let selector_hex = format!("0x{}", hex::encode(&hash[0..4]));
+    /// Polls every signature; the first one returning true fires the trigger.
+    pub fn new(rpc_url: &str, target_contract: &str, state_check_func_sigs: &[String]) -> Self {
+        let calldata_hex = state_check_func_sigs
+            .iter()
+            .map(|sig| format!("0x{}", hex::encode(&keccak256(sig.as_bytes())[0..4])))
+            .collect();
 
         Self {
             rpc_url: rpc_url.to_string(),
             target_contract: target_contract.to_string(),
-            calldata_hex: selector_hex,
+            calldata_hex,
         }
     }
 
@@ -37,26 +40,28 @@ impl StatePoller {
         loop {
             interval.tick().await;
 
-            let payload = json!({
-                "jsonrpc": "2.0",
-                "method": "eth_call",
-                "params": [{
-                    "to": self.target_contract,
-                    "data": self.calldata_hex
-                }, "latest"],
-                "id": 1
-            });
+            for data in &self.calldata_hex {
+                let payload = json!({
+                    "jsonrpc": "2.0",
+                    "method": "eth_call",
+                    "params": [{
+                        "to": self.target_contract,
+                        "data": data
+                    }, "latest"],
+                    "id": 1
+                });
 
-            if let Ok(resp) = client.post(&self.rpc_url).json(&payload).send().await {
-                if let Ok(body) = resp.json::<Value>().await {
-                    if let Some(result_hex) = body.get("result").and_then(|r| r.as_str()) {
-                        let clean = result_hex.trim_start_matches("0x");
-                        // ABI bool: the 32-byte word must be exactly 1.
-                        if let Ok(bytes) = hex::decode(clean) {
-                            if bytes.len() == 32 && bytes[..31].iter().all(|&b| b == 0) && bytes[31] == 1 {
-                                info!("StatePoller detected sale is now active on contract: {}", self.target_contract);
-                                let _ = trigger_tx.send(SnipeTrigger::StateFlipDetected { new_state: true }).await;
-                                return;
+                if let Ok(resp) = client.post(&self.rpc_url).json(&payload).send().await {
+                    if let Ok(body) = resp.json::<Value>().await {
+                        if let Some(result_hex) = body.get("result").and_then(|r| r.as_str()) {
+                            let clean = result_hex.trim_start_matches("0x");
+                            // ABI bool: the 32-byte word must be exactly 1.
+                            if let Ok(bytes) = hex::decode(clean) {
+                                if bytes.len() == 32 && bytes[..31].iter().all(|&b| b == 0) && bytes[31] == 1 {
+                                    info!("StatePoller detected sale is now active on contract: {}", self.target_contract);
+                                    let _ = trigger_tx.send(SnipeTrigger::StateFlipDetected { new_state: true }).await;
+                                    return;
+                                }
                             }
                         }
                     }

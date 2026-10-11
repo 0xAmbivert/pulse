@@ -10,7 +10,8 @@ const MONITOR_ABANDON_AFTER: std::time::Duration = std::time::Duration::from_sec
 
 pub struct SubmittedTx {
     pub worker: Arc<WalletWorker>,
-    pub tx_hash: String,
+    /// Every hash broadcast for this nonce (original + speedups). Any of them may land.
+    pub tx_hashes: Vec<String>,
     pub nonce: u64,
     pub max_fee_wei: u128,
     pub priority_fee_wei: u128,
@@ -43,12 +44,17 @@ pub fn spawn_tx_monitor(
             // Stop tracking after the abandon window: the nonce may be consumed or the tx dropped.
             if started.elapsed() >= MONITOR_ABANDON_AFTER {
                 let _ = ui_log_tx
-                    .send(format!("⏹️ Stopped tracking {} after {}s without a receipt", tx.tx_hash, MONITOR_ABANDON_AFTER.as_secs()))
+                    .send(format!("⏹️ Stopped tracking {} after {}s without a receipt", tx.tx_hashes.last().map(String::as_str).unwrap_or("?"), MONITOR_ABANDON_AFTER.as_secs()))
                     .await;
                 break;
             }
 
-            if let Some(receipt) = rpc_racer.poll_receipt(&tx.tx_hash).await {
+            if let Some(receipt) = rpc_racer.poll_receipts(&tx.tx_hashes).await {
+                let landed_hash = receipt
+                    .get("transactionHash")
+                    .and_then(|h| h.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| tx.tx_hashes.last().cloned().unwrap_or_default());
                 let status_ok = receipt
                     .get("status")
                     .and_then(|s| s.as_str())
@@ -64,24 +70,24 @@ pub fn spawn_tx_monitor(
 
                 if status_ok {
                     let _ = ui_log_tx
-                        .send(format!("🎉 Tx Confirmed! {} (Block: {})", tx.tx_hash, block_num))
+                        .send(format!("🎉 Tx Confirmed! {} (Block: {})", landed_hash, block_num))
                         .await;
                     let alerts_c = alerts.clone();
                     let msg = format!(
                         "Wallet: {}\nTx: {}\nBlock: {}\nGas: {}",
-                        tx.worker.address, tx.tx_hash, block_num, gas_used
+                        tx.worker.address, landed_hash, block_num, gas_used
                     );
                     tokio::spawn(async move {
                         alerts_c.dispatch_alert("🎯 Mint Confirmed", &msg, true).await;
                     });
                 } else {
                     let _ = ui_log_tx
-                        .send(format!("❌ Tx Reverted on-chain: {}", tx.tx_hash))
+                        .send(format!("❌ Tx Reverted on-chain: {}", landed_hash))
                         .await;
                     let alerts_c = alerts.clone();
                     let msg = format!(
                         "Wallet: {}\nTx: {}\nReverted in block: {}",
-                        tx.worker.address, tx.tx_hash, block_num
+                        tx.worker.address, landed_hash, block_num
                     );
                     tokio::spawn(async move {
                         alerts_c.dispatch_alert("⚠️ Mint Reverted", &msg, false).await;
@@ -113,7 +119,7 @@ pub fn spawn_tx_monitor(
                                 };
                                 let new_hash =
                                     format!("{:#x}", alloy::primitives::keccak256(&new_bytes));
-                                tx.tx_hash = new_hash.clone();
+                                tx.tx_hashes.push(new_hash.clone());
                                 tx.max_fee_wei = new_max;
                                 tx.priority_fee_wei = new_prio;
                                 tx.last_bump = std::time::Instant::now();

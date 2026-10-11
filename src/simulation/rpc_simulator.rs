@@ -65,11 +65,11 @@ impl RpcSimulator {
             });
         }
 
-        let gas_used = if let Some(res) = body.get("result").and_then(|r| r.as_str()) {
-            u64::from_str_radix(res.trim_start_matches("0x"), 16).unwrap_or(21000)
-        } else {
-            21000
-        };
+        let res = body
+            .get("result")
+            .and_then(|r| r.as_str())
+            .ok_or("eth_estimateGas returned no result")?;
+        let gas_used = u64::from_str_radix(res.trim_start_matches("0x"), 16)?;
 
         Ok(SimResult {
             success: true,

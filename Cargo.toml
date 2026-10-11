@@ -16,7 +16,6 @@ hex = "0.4"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
-futures-util = "0.3"
 
 # CLI, Config & Serialization
 clap = { version = "4.5", features = ["derive"] }

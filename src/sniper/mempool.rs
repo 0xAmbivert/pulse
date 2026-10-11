@@ -70,7 +70,7 @@ impl MempoolScanner {
     }
 
     async fn run_ws_loop(&self, trigger_tx: mpsc::Sender<SnipeTrigger>) {
-        use futures_util::{SinkExt, StreamExt};
+        use futures::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
         let mut backoff_ms = 1000u64;

@@ -180,46 +180,61 @@ impl RpcRacer {
         outcomes
     }
 
-    /// Fetches transaction receipt concurrently from all healthy endpoints, returning the fastest valid receipt.
-    pub async fn poll_receipt(&self, tx_hash: &str) -> Option<Value> {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "method": "eth_getTransactionReceipt",
-            "params": [tx_hash],
-            "id": 1
-        });
+    /// Fetches a receipt for any of the given transaction hashes from all healthy endpoints.
+    /// Returns the first non-null receipt and aborts the remaining in-flight requests.
+    pub async fn poll_receipts(&self, tx_hashes: &[String]) -> Option<Value> {
+        use futures::stream::{FuturesUnordered, StreamExt};
 
-        use futures_util::stream::{FuturesUnordered, StreamExt};
-        let tasks = FuturesUnordered::new();
-        for ep in &self.endpoints {
-            if !ep.is_healthy {
-                continue;
-            }
-            let client = self.client.clone();
-            let url = ep.url.clone();
-            let p = payload.clone();
-            tasks.push(tokio::spawn(async move {
-                if let Ok(resp) = client.post(&url).json(&p).send().await {
-                    if let Ok(json_body) = resp.json::<Value>().await {
-                        if let Some(receipt) = json_body.get("result") {
-                            if !receipt.is_null() {
-                                return Some(receipt.clone());
+        let mut handles = Vec::new();
+        let mut tasks = FuturesUnordered::new();
+        for hash in tx_hashes {
+            let payload = json!({
+                "jsonrpc": "2.0",
+                "method": "eth_getTransactionReceipt",
+                "params": [hash],
+                "id": 1
+            });
+            for ep in &self.endpoints {
+                if !ep.is_healthy {
+                    continue;
+                }
+                let client = self.client.clone();
+                let url = ep.url.clone();
+                let p = payload.clone();
+                let handle = tokio::spawn(async move {
+                    if let Ok(resp) = client.post(&url).json(&p).send().await {
+                        if let Ok(json_body) = resp.json::<Value>().await {
+                            if let Some(receipt) = json_body.get("result") {
+                                if !receipt.is_null() {
+                                    return Some(receipt.clone());
+                                }
                             }
                         }
                     }
-                }
-                None
-            }));
-        }
-
-        let mut stream = tasks;
-        while let Some(res) = stream.next().await {
-            if let Ok(Some(receipt)) = res {
-                return Some(receipt);
+                    None
+                });
+                handles.push(handle.abort_handle());
+                tasks.push(handle);
             }
         }
 
-        None
+        let mut found = None;
+        while let Some(res) = tasks.next().await {
+            if let Ok(Some(receipt)) = res {
+                found = Some(receipt);
+                break;
+            }
+        }
+
+        for handle in handles {
+            handle.abort();
+        }
+        found
+    }
+
+    /// Fetches a receipt for a single transaction hash.
+    pub async fn poll_receipt(&self, tx_hash: &str) -> Option<Value> {
+        self.poll_receipts(&[tx_hash.to_string()]).await
     }
 
     /// Queries the latest block's baseFeePerGas from healthy endpoints.

@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use pulse::alerts::AlertDispatcher;
 use pulse::config::AppConfig;
-use pulse::gas::{gwei_to_wei, wei_to_gwei, GasEngine};
+use pulse::gas::{wei_to_gwei, GasEngine};
 use pulse::network::{MevBuilderClient, RpcRacer};
 use pulse::simulation::RpcSimulator;
 use pulse::sniper::{CountdownSniper, MempoolScanner, SnipeTrigger, StatePoller};
@@ -51,7 +51,7 @@ fn prepare_snipes(
         let calldata = if config.drop.seadrop_contract.is_some() {
             config.drop.build_seadrop_calldata(Some(&worker.address), 1)?
         } else {
-            config.drop.build_calldata_for_caller(Some(&worker.address))?
+            config.drop.build_calldata_for_caller(Some(&worker.address), 1)?
         };
         let nonce = worker.nonce_mgr.current();
         let (raw_tx, n) = worker.build_and_sign_eip1559(
@@ -95,11 +95,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     pulse::crypto::harden_process();
 
     // Initialize file-backed tracing so logs/warnings are preserved without interfering with TUI
-    if let Ok(log_file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/pulse.log")
+    let mut log_opts = std::fs::OpenOptions::new();
+    log_opts.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        log_opts.mode(0o600);
+    }
+    if let Ok(log_file) = log_opts.open("/tmp/pulse.log") {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(std::sync::Mutex::new(log_file))
             .with_ansi(false)
@@ -121,7 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Setup Engine Components
     let rpc_racer = Arc::new(RpcRacer::new(&config.chain.rpc_urls, config.chain.rpc_timeout_ms));
-    let gas_engine = Arc::new(GasEngine::new(config.gas.hard_gas_ceiling_gwei, config.gas.max_priority_fee_gwei, config.gas.speedup_bump_percent));
+    // The user's Max Gas Fee is the per-tx cap, bounded by the hard ceiling from config.
+    let effective_cap_gwei = config.gas.max_fee_gwei.min(config.gas.hard_gas_ceiling_gwei);
+    let gas_engine = Arc::new(GasEngine::new(effective_cap_gwei, config.gas.max_priority_fee_gwei, config.gas.speedup_bump_percent));
     let alerts = Arc::new(AlertDispatcher::new(
         config.alerts.discord_webhook.clone(),
         config.alerts.telegram_bot_token.clone(),
@@ -161,7 +166,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut state = DashboardState::new(config.drop.target_contract.clone());
     state.active_wallets = workers.len();
-    state.current_base_fee = config.gas.max_fee_gwei; // Default baseline
+    state.current_base_fee = 0.0;
+    state.add_log(format!("🧢 Max fee cap: {:.2} Gwei", effective_cap_gwei));
 
     let mut events = EventHandler::new(250);
     let (trigger_tx, mut trigger_rx) = mpsc::channel::<SnipeTrigger>(10);
@@ -219,7 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let poller = StatePoller::new(
             &config.chain.rpc_urls[0],
             &target_contract,
-            &config.drop.flip_function_signatures[0],
+            &config.drop.flip_function_signatures,
         );
         let tx_clone = trigger_tx.clone();
         tokio::spawn(async move {
@@ -253,7 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sim_calldata = if config.drop.seadrop_contract.is_some() {
         config.drop.build_seadrop_calldata(Some(&workers[0].address), 1)
     } else {
-        config.drop.build_calldata_for_caller(Some(&workers[0].address))
+        config.drop.build_calldata_for_caller(Some(&workers[0].address), 1)
     };
     match (sim_calldata, config.drop.mint_value_wei.parse::<u128>()) {
         (Ok(sim_calldata), Ok(sim_val)) => {
@@ -273,11 +279,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Pre-Sign Transactions ahead of drop for instantaneous, zero-latency burst dispatch
+    let initial_base_fee_wei = rpc_racer.fetch_latest_base_fee().await.unwrap_or(0);
+    state.current_base_fee = wei_to_gwei(initial_base_fee_wei);
     let mut prepared_snipes = match prepare_snipes(
         &workers,
         &config,
         &target_contract,
-        gwei_to_wei(state.current_base_fee),
+        initial_base_fee_wei,
         &gas_engine,
     ) {
         Ok(snipes) => {
@@ -398,7 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                     let submitted = SubmittedTx {
                         worker: prepared.worker.clone(),
-                        tx_hash: prepared.tx_hash.clone(),
+                        tx_hashes: vec![prepared.tx_hash.clone()],
                         nonce: prepared.nonce,
                         max_fee_wei: prepared.max_fee_wei,
                         priority_fee_wei: prepared.priority_fee_wei,

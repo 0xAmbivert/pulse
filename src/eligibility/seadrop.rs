@@ -127,12 +127,10 @@ impl SeaDropInspector {
             return Err(decoded);
         }
 
-        if let Some(res) = body.get("result").and_then(|r| r.as_str()) {
-            let gas = u64::from_str_radix(res.trim_start_matches("0x"), 16).unwrap_or(120_000);
-            return Ok(gas);
-        }
-
-        Err("Unknown RPC response".to_string())
+        let res = body.get("result").and_then(|r| r.as_str())
+            .ok_or_else(|| "Unknown RPC response (no result)".to_string())?;
+        u64::from_str_radix(res.trim_start_matches("0x"), 16)
+            .map_err(|e| format!("Invalid gas estimate '{res}': {e}"))
     }
 
     async fn eth_call(&self, to: &str, data: &str, value: &str) -> Result<String, String> {

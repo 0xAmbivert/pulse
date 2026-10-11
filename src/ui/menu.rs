@@ -142,7 +142,7 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                     println!("🌊 Detected SeaDrop protocol drop! Price: {} Wei ({:.6} ETH), Max per wallet: {}", sd.mint_price_wei, sd.mint_price_wei as f64 / 1e18, sd.max_per_wallet);
                     detected_price_wei = Some(sd.mint_price_wei.to_string());
                     let clean_fee = sd.fee_recipient.clone().unwrap_or_else(|| "0x0000a26b00c1f0df003000390027140000faa719".to_string());
-                    detected_mint_func = Some(format!("mintPublic(address,address,address,uint256) | Fee: {}", clean_fee));
+                    detected_mint_func = Some("mintPublic(address,address,address,uint256)".to_string());
                     seadrop_contract = Some(crate::eligibility::seadrop::SEADROP_V1_ADDRESS.to_string());
                     seadrop_fee = Some(clean_fee);
                 }
@@ -173,16 +173,21 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                     val_input.trim().to_string()
                 };
 
-                // 6. Max Gas Fee in Gwei (Optional: Enter for default)
-                print!("6️⃣  Enter Max Gas Fee in Gwei (Press Enter for '{:.1}'): ", base_config.gas.max_fee_gwei);
-                io::stdout().flush()?;
-                let Some(gas_input) = read_line_opt()? else {
-                    return Ok(MenuAction::Exit);
-                };
-                let max_gas_fee = if gas_input.trim().is_empty() {
-                    base_config.gas.max_fee_gwei
-                } else {
-                    gas_input.trim().parse().unwrap_or(base_config.gas.max_fee_gwei)
+                // 6. Max Gas Fee in Gwei (Optional: Enter for default). Invalid input re-prompts.
+                let max_gas_fee = loop {
+                    print!("6⃣  Enter Max Gas Fee in Gwei (Press Enter for '{:.1}'): ", base_config.gas.max_fee_gwei);
+                    io::stdout().flush()?;
+                    let Some(gas_input) = read_line_opt()? else {
+                        return Ok(MenuAction::Exit);
+                    };
+                    let trimmed = gas_input.trim();
+                    if trimmed.is_empty() {
+                        break base_config.gas.max_fee_gwei;
+                    }
+                    match trimmed.parse::<f64>() {
+                        Ok(v) if v.is_finite() && v > 0.0 => break v,
+                        _ => println!("❌ Invalid gas fee '{trimmed}'. Enter a positive number of Gwei."),
+                    }
                 };
 
                 // 7. Snipe Trigger Mode Selection
@@ -279,6 +284,15 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                     Ok(report) => {
                         println!("{}", checker.format_report(&report));
 
+                        if report.is_sold_out {
+                            println!("⛔ Drop is sold out. Sniper not offered.");
+                            continue;
+                        }
+                        if !report.wallet_status.is_eligible {
+                            println!("⛔ Wallet is not eligible ({}). Sniper not offered.", report.wallet_status.status_reason);
+                            continue;
+                        }
+
                         print!("👉 Would you like to load this contract into the Sniper now? [y/N]: ");
                         io::stdout().flush()?;
                         let Some(launch_in) = read_line_opt()? else {
@@ -299,8 +313,15 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                             if let Ok(key) = ProtectedKey::from_hex(clean_hex) {
                                 let mut session_config = base_config.clone();
                                 session_config.chain.chain_id = report.target.chain_id;
-                                session_config.chain.rpc_urls = vec![rpc_url];
-                                session_config.drop.target_contract = report.target.contract_address;
+                                // Keep the fallback pool; the user's RPC goes first.
+                                let mut pool = vec![rpc_url];
+                                for url in &base_config.chain.rpc_urls {
+                                    if !pool.contains(url) {
+                                        pool.push(url.clone());
+                                    }
+                                }
+                                session_config.chain.rpc_urls = pool;
+                                session_config.drop.target_contract = report.target.contract_address.clone();
                                 session_config.drop.mint_value_wei = report.wallet_status.price_wei.to_string();
 
                                 if report.drop_mechanism.contains("SeaDrop") {

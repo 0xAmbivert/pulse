@@ -31,6 +31,11 @@ impl NonceManager {
         self.current_nonce.store(nonce, Ordering::SeqCst);
     }
 
+    /// Rolls back a reserved nonce only if no later nonce was reserved since.
+    pub fn release(&self, nonce: u64) {
+        let _ = self.current_nonce.compare_exchange(nonce + 1, nonce, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
     /// Resynchronizes the nonce by querying `eth_getTransactionCount` with tag "pending" from RPC.
     pub async fn resync_from_rpc(&self, rpc_url: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
@@ -64,17 +69,6 @@ impl NonceManager {
         Ok(nonce)
     }
 
-    /// Checks for nonce gaps: queries on-chain pending count and updates forward if on-chain nonce is ahead.
-    pub async fn resync_if_ahead(&self, rpc_url: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let on_chain = self.resync_from_rpc(rpc_url).await?;
-        let curr = self.current();
-        if on_chain > curr {
-            self.set_nonce(on_chain);
-            Ok(on_chain)
-        } else {
-            Ok(curr)
-        }
-    }
 }
 
 #[cfg(test)]
