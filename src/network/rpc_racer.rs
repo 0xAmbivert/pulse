@@ -265,6 +265,32 @@ impl RpcRacer {
         None
     }
 
+    /// Queries the on-chain confirmed transaction count (nonce) for an address.
+    pub async fn fetch_transaction_count(&self, address: &str) -> Option<u64> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getTransactionCount",
+            "params": [address, "latest"],
+            "id": 1
+        });
+
+        for ep in &self.endpoints {
+            if !ep.is_healthy {
+                continue;
+            }
+            if let Ok(resp) = self.client.post(&ep.url).json(&payload).send().await {
+                if let Ok(json_body) = resp.json::<Value>().await {
+                    if let Some(count_hex) = json_body.get("result").and_then(|r| r.as_str()) {
+                        if let Ok(count) = u64::from_str_radix(count_hex.trim_start_matches("0x"), 16) {
+                            return Some(count);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn endpoints(&self) -> &[RpcEndpoint] {
         &self.endpoints
     }

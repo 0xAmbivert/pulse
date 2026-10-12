@@ -43,6 +43,11 @@ pub fn spawn_tx_monitor(
 
             // Stop tracking after the abandon window: the nonce may be consumed or the tx dropped.
             if started.elapsed() >= MONITOR_ABANDON_AFTER {
+                if let Some(on_chain_nonce) = rpc_racer.fetch_transaction_count(&tx.worker.address).await {
+                    if on_chain_nonce > tx.nonce {
+                        tx.worker.nonce_mgr.set_nonce(on_chain_nonce);
+                    }
+                }
                 let _ = ui_log_tx
                     .send(format!("⏹️ Stopped tracking {} after {}s without a receipt", tx.tx_hashes.last().map(String::as_str).unwrap_or("?"), MONITOR_ABANDON_AFTER.as_secs()))
                     .await;
@@ -97,6 +102,20 @@ pub fn spawn_tx_monitor(
             } else if auto_speedup
                 && tx.last_bump.elapsed().as_millis() >= speedup_threshold_ms as u128
             {
+                // Verify on-chain nonce before bumping: if already mined or superseded, stop monitoring
+                if let Some(on_chain_nonce) = rpc_racer.fetch_transaction_count(&tx.worker.address).await {
+                    if on_chain_nonce > tx.nonce {
+                        let _ = ui_log_tx
+                            .send(format!(
+                                "⏹️ Nonce gap resolved: on-chain nonce {} > tx nonce {}. Transaction mined or superseded.",
+                                on_chain_nonce, tx.nonce
+                            ))
+                            .await;
+                        tx.worker.nonce_mgr.set_nonce(on_chain_nonce);
+                        break;
+                    }
+                }
+
                 match gas_engine.calculate_speedup_fees(tx.max_fee_wei, tx.priority_fee_wei) {
                     Ok((new_max, new_prio)) => {
                         match tx.worker.build_and_sign_eip1559(
