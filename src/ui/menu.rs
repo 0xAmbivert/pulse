@@ -7,7 +7,7 @@ use crate::eligibility::opensea::OpenSeaClient;
 
 pub enum MenuAction {
     Start {
-        key: ProtectedKey,
+        keys: Vec<ProtectedKey>,
         session_config: Box<AppConfig>,
     },
     Exit,
@@ -61,8 +61,8 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 println!("\n--- ⚡ Ephemeral RAM Configuration (Zero Disk Saves) ---");
                 println!("🔒 Everything entered here lives only in RAM for this active session and is wiped on exit.\n");
 
-                // 1. Private Key (RAM only, hidden input via rpassword when interactive, stdin when piped)
-                let pk_input = match read_private_key("1️⃣  Paste raw private key (Hex): ") {
+                // 1. Private Key(s) (RAM only, hidden input via rpassword when interactive, stdin when piped)
+                let pk_input = match read_private_key("1️⃣  Paste raw private key(s) (Hex, comma-separated for multi-wallet): ") {
                     Ok(Some(p)) => p,
                     Ok(None) => return Ok(MenuAction::Exit),
                     Err(e) => {
@@ -71,20 +71,39 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                     }
                 };
                 let pk_guard = zeroize::Zeroizing::new(pk_input);
-                let clean_hex = pk_guard.as_str().trim().trim_start_matches("0x");
+                let raw_keys: Vec<&str> = pk_guard
+                    .as_str()
+                    .split(',')
+                    .map(|s| s.trim().trim_start_matches("0x"))
+                    .filter(|s| !s.is_empty())
+                    .collect();
 
-                if clean_hex.len() != 64 {
-                    println!("❌ Invalid private key length. Must be 64 hex characters.");
+                if raw_keys.is_empty() {
+                    println!("❌ No private keys provided.");
                     continue;
                 }
 
-                let key = match ProtectedKey::from_hex(clean_hex) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        println!("❌ Invalid hex key: {}", e);
-                        continue;
+                let mut keys = Vec::new();
+                let mut parse_failed = false;
+                for k in raw_keys {
+                    if k.len() != 64 {
+                        println!("❌ Invalid private key length ({} chars). Each must be 64 hex characters.", k.len());
+                        parse_failed = true;
+                        break;
                     }
-                };
+                    match ProtectedKey::from_hex(k) {
+                        Ok(key) => keys.push(key),
+                        Err(e) => {
+                            println!("❌ Invalid hex key: {}", e);
+                            parse_failed = true;
+                            break;
+                        }
+                    }
+                }
+                if parse_failed || keys.is_empty() {
+                    continue;
+                }
+                println!("🔑 Successfully parsed {} ephemeral wallet key(s) into RAM.", keys.len());
 
                 // 2. Target Contract Address or OpenSea URL
                 print!("2️⃣  Enter Target NFT Contract Address or OpenSea URL: ");
@@ -137,13 +156,14 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 // Check on-chain SeaDrop parameters if applicable
                 let mut seadrop_contract = None;
                 let mut seadrop_fee = None;
-                let seadrop_inspector = crate::eligibility::seadrop::SeaDropInspector::new(&primary_rpc);
+                let custom_sd = base_config.drop.seadrop_contract.as_deref().unwrap_or(crate::eligibility::seadrop::SEADROP_V1_ADDRESS);
+                let seadrop_inspector = crate::eligibility::seadrop::SeaDropInspector::with_address(&primary_rpc, custom_sd);
                 if let Some(sd) = seadrop_inspector.fetch_public_drop(&target_addr).await {
                     println!("🌊 Detected SeaDrop protocol drop! Price: {} Wei ({:.6} ETH), Max per wallet: {}", sd.mint_price_wei, sd.mint_price_wei as f64 / 1e18, sd.max_per_wallet);
                     detected_price_wei = Some(sd.mint_price_wei.to_string());
                     let clean_fee = sd.fee_recipient.clone().unwrap_or_else(|| "0x0000a26b00c1f0df003000390027140000faa719".to_string());
                     detected_mint_func = Some("mintPublic(address,address,address,uint256)".to_string());
-                    seadrop_contract = Some(crate::eligibility::seadrop::SEADROP_V1_ADDRESS.to_string());
+                    seadrop_contract = Some(seadrop_inspector.seadrop_address.clone());
                     seadrop_fee = Some(clean_fee);
                 }
 
@@ -244,7 +264,7 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 session_config.gas.max_fee_gwei = max_gas_fee;
 
                 println!("\n🔒 Session parameters locked into memory buffer. Booting engine...");
-                return Ok(MenuAction::Start { key, session_config: Box::new(session_config) });
+                return Ok(MenuAction::Start { keys, session_config: Box::new(session_config) });
             }
             "2" => {
                 println!("\n--- 🔍 Mint & Wallet Eligibility Checker ---");
@@ -354,7 +374,7 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                                 }
 
                                 println!("\n🚀 Loading verified drop into sniper. Booting engine...");
-                                return Ok(MenuAction::Start { key, session_config: Box::new(session_config) });
+                                return Ok(MenuAction::Start { keys: vec![key], session_config: Box::new(session_config) });
                             } else {
                                 println!("❌ Invalid private key. Returning to menu.");
                             }

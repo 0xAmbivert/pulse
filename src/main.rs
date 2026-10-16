@@ -35,10 +35,16 @@ fn prepare_snipes(
     config: &AppConfig,
     target_contract: &str,
     current_base_fee_wei: u128,
+    prev_base_fee_wei: Option<u128>,
     gas_engine: &GasEngine,
 ) -> Result<Vec<PreparedSnipe>, Box<dyn std::error::Error + Send + Sync>> {
     let mut snipes = Vec::new();
-    let (max_fee_wei, max_priority_fee_wei) = gas_engine.calculate_dynamic_fees(current_base_fee_wei, None)?;
+    let (max_fee_wei, max_priority_fee_wei) = gas_engine.calculate_dynamic_fees_with_acceleration(
+        current_base_fee_wei,
+        prev_base_fee_wei,
+        1,
+        None,
+    )?;
     let value = config
         .drop
         .mint_value_wei
@@ -117,9 +123,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let base_config = AppConfig::load_from_file(&cli.config)?;
 
-    let (key, config) = match run_interactive_menu(&base_config).await? {
+    let (keys, config) = match run_interactive_menu(&base_config).await? {
         MenuAction::Exit => return Ok(()),
-        MenuAction::Start { key, session_config } => (key, *session_config),
+        MenuAction::Start { keys, session_config } => (keys, *session_config),
     };
 
     // Setup Engine Components
@@ -133,15 +139,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.alerts.telegram_chat_id.clone(),
     ));
 
-    let addr = pulse::crypto::get_address_from_protected(&key)?;
-    let worker = WalletWorker::new(key, 0)?;
-    if let Some(ep) = rpc_racer.endpoints().first() {
-        if let Err(e) = worker.nonce_mgr.resync_from_rpc(&ep.url).await {
-            println!("⚠️ Failed to fetch nonce for {}: {}", addr, e);
+    let mut workers = Vec::new();
+    for key in keys {
+        let addr = pulse::crypto::get_address_from_protected(&key)?;
+        let worker = WalletWorker::new(key, 0)?;
+        if let Some(ep) = rpc_racer.endpoints().first() {
+            if let Err(e) = worker.nonce_mgr.resync_from_rpc(&ep.url).await {
+                println!("⚠️ Failed to fetch nonce for {}: {}", addr, e);
+            }
         }
+        println!("🔓 Active RAM wallet initialized: {} (Nonce: {})", addr, worker.nonce_mgr.current());
+        workers.push(Arc::new(worker));
     }
-    println!("🔓 Active RAM wallet initialized: {} (Nonce: {})", addr, worker.nonce_mgr.current());
-    let workers = vec![Arc::new(worker)];
 
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
@@ -281,11 +290,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Pre-Sign Transactions ahead of drop for instantaneous, zero-latency burst dispatch
     let initial_base_fee_wei = rpc_racer.fetch_latest_base_fee().await.unwrap_or(0);
     state.current_base_fee = wei_to_gwei(initial_base_fee_wei);
+    let mut prev_base_fee_wei: Option<u128> = None;
     let mut prepared_snipes = match prepare_snipes(
         &workers,
         &config,
         &target_contract,
         initial_base_fee_wei,
+        prev_base_fee_wei,
         &gas_engine,
     ) {
         Ok(snipes) => {
@@ -365,7 +376,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     SnipeTrigger::BaseFeeUpdated { base_fee_wei } => {
                         state.current_base_fee = wei_to_gwei(*base_fee_wei);
                         if !has_fired {
-                            match prepare_snipes(&workers, &config, &target_contract, *base_fee_wei, &gas_engine) {
+                            match prepare_snipes(&workers, &config, &target_contract, *base_fee_wei, prev_base_fee_wei, &gas_engine) {
                                 Ok(snipes) => prepared_snipes = snipes,
                                 Err(e) => {
                                     state.add_log(format!("⚠️ Base fee ({:.2} Gwei) exceeds ceiling: {e}; holding dispatch", state.current_base_fee));
@@ -373,6 +384,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 }
                             }
                         }
+                        prev_base_fee_wei = Some(*base_fee_wei);
                         continue;
                     },
                     SnipeTrigger::CountdownReached { target_unix } => format!("🔥 Trigger: Countdown reached {}", target_unix),

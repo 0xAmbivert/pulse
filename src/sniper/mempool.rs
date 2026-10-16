@@ -74,6 +74,7 @@ impl MempoolScanner {
         use tokio_tungstenite::tungstenite::Message;
 
         let mut backoff_ms = 1000u64;
+        let mut is_reconnect = false;
         let http_url = if self.rpc_url.starts_with("wss://") {
             self.rpc_url.replacen("wss://", "https://", 1)
         } else {
@@ -109,6 +110,12 @@ impl MempoolScanner {
                         .timeout(Duration::from_millis(2000))
                         .build()
                         .unwrap_or_else(|_| Client::new());
+
+                    if is_reconnect {
+                        info!("WS Mempool reconnected. Executing pending block catch-up for missed transactions...");
+                        self.catch_up_pending(&client, &http_url, &trigger_tx).await;
+                    }
+                    is_reconnect = true;
 
                     let sem = Arc::new(Semaphore::new(16));
 
@@ -193,6 +200,51 @@ impl MempoolScanner {
                 Err(_) => {
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(10000);
+                }
+            }
+        }
+    }
+
+    async fn catch_up_pending(&self, client: &Client, http_url: &str, trigger_tx: &mpsc::Sender<SnipeTrigger>) {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getBlockByNumber",
+            "params": ["pending", true],
+            "id": 999
+        });
+
+        if let Ok(resp) = client.post(http_url).json(&payload).send().await {
+            if let Ok(body) = resp.json::<Value>().await {
+                if let Some(result) = body.get("result") {
+                    if let Some(base_fee_hex) = result.get("baseFeePerGas").and_then(|b| b.as_str()) {
+                        if let Ok(base_fee_wei) = u128::from_str_radix(base_fee_hex.trim_start_matches("0x"), 16) {
+                            let _ = trigger_tx.send(SnipeTrigger::BaseFeeUpdated { base_fee_wei }).await;
+                        }
+                    }
+                    if let Some(transactions) = result.get("transactions").and_then(|t| t.as_array()) {
+                        for tx_obj in transactions {
+                            let sender_addr = tx_obj.get("from").and_then(|f| f.as_str()).unwrap_or("").to_lowercase();
+                            let to_addr = tx_obj.get("to").and_then(|t| t.as_str()).unwrap_or("").to_lowercase();
+                            let input_data = tx_obj.get("input").and_then(|i| i.as_str()).unwrap_or("");
+
+                            let is_owner_match = self.owner_address.as_ref().is_none_or(|o| *o == sender_addr);
+                            let target_matches = to_addr == self.target_contract;
+                            let selector_matches = self.matches_selector(input_data);
+
+                            if is_owner_match && target_matches && selector_matches {
+                                let hash = tx_obj.get("hash").and_then(|h| h.as_str()).unwrap_or("unknown").to_string();
+                                info!(
+                                    "WS Mempool reconnect catch-up detected matching trigger tx: {} from {} to {}",
+                                    hash, sender_addr, to_addr
+                                );
+                                let _ = trigger_tx.send(SnipeTrigger::MempoolDetected {
+                                    owner_tx_hash: hash,
+                                    method: input_data.chars().take(10).collect(),
+                                }).await;
+                                return;
+                            }
+                        }
+                    }
                 }
             }
         }

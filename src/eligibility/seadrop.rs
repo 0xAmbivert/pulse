@@ -8,10 +8,15 @@ pub const SEADROP_V1_ADDRESS: &str = "0x00005ea00ac477b1030ce78506496e8c2de24bf5
 pub struct SeaDropInspector {
     rpc_url: String,
     client: Client,
+    pub seadrop_address: String,
 }
 
 impl SeaDropInspector {
     pub fn new(rpc_url: &str) -> Self {
+        Self::with_address(rpc_url, SEADROP_V1_ADDRESS)
+    }
+
+    pub fn with_address(rpc_url: &str, seadrop_address: &str) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_millis(5000))
             .build()
@@ -19,6 +24,7 @@ impl SeaDropInspector {
         Self {
             rpc_url: rpc_url.to_string(),
             client,
+            seadrop_address: seadrop_address.to_lowercase(),
         }
     }
 
@@ -28,7 +34,7 @@ impl SeaDropInspector {
         let clean = nft_contract.trim().trim_start_matches("0x").to_lowercase();
         let calldata = format!("0xbc6a629c{:0>64}", clean);
 
-        let res = self.eth_call(SEADROP_V1_ADDRESS, &calldata, "0x0").await.ok()?;
+        let res = self.eth_call(&self.seadrop_address, &calldata, "0x0").await.ok()?;
         let hex_res = res.trim_start_matches("0x");
 
         if hex_res.len() < 384 {
@@ -57,7 +63,7 @@ impl SeaDropInspector {
     pub async fn fetch_allowed_fee_recipient(&self, nft_contract: &str) -> Option<String> {
         let clean = nft_contract.trim().trim_start_matches("0x").to_lowercase();
         let calldata = format!("0x68632274{:0>64}", clean);
-        let res = self.eth_call(SEADROP_V1_ADDRESS, &calldata, "0x0").await.ok()?;
+        let res = self.eth_call(&self.seadrop_address, &calldata, "0x0").await.ok()?;
         // ABI: address[] is dynamic. Word 0 = offset, word at offset = length, then elements.
         let hex_res = res.trim_start_matches("0x");
         let word = |i: usize| -> Option<&str> { hex_res.get(i * 64..(i + 1) * 64) };

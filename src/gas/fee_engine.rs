@@ -52,6 +52,36 @@ impl GasEngine {
         Ok((max_fee, priority_fee))
     }
 
+    /// Computes EIP-1559 fees with momentum / acceleration protection:
+    /// If consecutive base fees indicate an upward surge, projects the base fee `blocks_ahead` into the future
+    /// (compounding up to 12.5% maximum EVM increase per block per EIP-1559) so pre-signed transactions
+    /// are not priced out during rapid gas spikes.
+    pub fn calculate_dynamic_fees_with_acceleration(
+        &self,
+        current_base_fee_wei: u128,
+        prev_base_fee_wei: Option<u128>,
+        blocks_ahead: u32,
+        custom_priority_gwei: Option<f64>,
+    ) -> Result<(u128, u128), GasError> {
+        let mut projected_base_fee = current_base_fee_wei;
+
+        if let Some(prev) = prev_base_fee_wei {
+            if current_base_fee_wei > prev && prev > 0 {
+                // Observed rate of change in basis points (100 bps = 1%)
+                // In EIP-1559, max increase per block is 12.5% (1250 bps).
+                let delta = current_base_fee_wei.saturating_sub(prev);
+                let rate_bps = (delta.saturating_mul(10_000) / prev).min(1250);
+
+                for _ in 0..blocks_ahead {
+                    let increase = (projected_base_fee.saturating_mul(rate_bps)).div_ceil(10_000);
+                    projected_base_fee = projected_base_fee.saturating_add(increase);
+                }
+            }
+        }
+
+        self.calculate_dynamic_fees(projected_base_fee, custom_priority_gwei)
+    }
+
     /// Computes replacement transaction gas fees (auto-speedup) bumping by `bump_percent` (e.g. 15%).
     /// Guaranteed to satisfy geth/reth replace-by-fee requirements.
     pub fn calculate_speedup_fees(
@@ -109,5 +139,27 @@ mod tests {
         let engine = GasEngine::new(25.0, 2.0, 15);
         let res = engine.calculate_speedup_fees(24_000_000_000, 2_000_000_000);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_dynamic_fees_with_acceleration() {
+        let engine = GasEngine::new(100.0, 2.0, 15);
+        let base_fee_prev = 10_000_000_000u128; // 10 Gwei
+        let base_fee_curr = 11_000_000_000u128; // 11 Gwei (+10%)
+
+        // No acceleration: (2 * 11) + 2 = 24 Gwei
+        let (max_no_accel, _) = engine.calculate_dynamic_fees(base_fee_curr, None).unwrap();
+        assert_eq!(max_no_accel, 24_000_000_000);
+
+        // With 1 block acceleration (+10% on 11 Gwei = 12.1 Gwei -> (2 * 12.1) + 2 = 26.2 Gwei)
+        let (max_accel, prio) = engine.calculate_dynamic_fees_with_acceleration(
+            base_fee_curr,
+            Some(base_fee_prev),
+            1,
+            None,
+        ).unwrap();
+        assert_eq!(prio, 2_000_000_000);
+        assert!(max_accel > max_no_accel);
+        assert_eq!(max_accel, 26_200_000_000);
     }
 }
