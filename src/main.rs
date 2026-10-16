@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use pulse::alerts::AlertDispatcher;
-use pulse::config::AppConfig;
+use pulse::config::{AppConfig, TriggerMode};
 use pulse::gas::{wei_to_gwei, GasEngine};
 use pulse::network::{MevBuilderClient, RpcRacer};
 use pulse::simulation::RpcSimulator;
@@ -55,9 +55,9 @@ fn prepare_snipes(
 
     for worker in workers {
         let calldata = if config.drop.seadrop_contract.is_some() {
-            config.drop.build_seadrop_calldata(Some(&worker.address), 1)?
+            config.drop.build_seadrop_calldata(Some(&worker.address), config.drop.mint_quantity)?
         } else {
-            config.drop.build_calldata_for_caller(Some(&worker.address), 1)?
+            config.drop.build_calldata_for_caller(Some(&worker.address), config.drop.mint_quantity)?
         };
         let nonce = worker.nonce_mgr.current();
         let (raw_tx, n) = worker.build_and_sign_eip1559(
@@ -200,50 +200,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 🔥 WIRING UP ALL SNIPERS & ENGINES TO FIX DEAD ENDS 🔥
 
-    // 1. Countdown Sniper
-    if let Some(target_unix) = config.drop.target_timestamp {
-        if target_unix > 0 {
-            let countdown = CountdownSniper::new(target_unix, 50);
-            let tx_clone = trigger_tx.clone();
-            tokio::spawn(async move {
-                countdown.wait_for_target(tx_clone).await;
-            });
-            state.add_log(format!("⏱️ Armed Countdown Sniper for Unix {}", target_unix));
+    // 1. Exclusive Trigger Mode Spawning
+    match config.drop.trigger_mode {
+        TriggerMode::Countdown => {
+            let target_unix = config.drop.target_timestamp.unwrap_or(0);
+            if target_unix > 0 {
+                let mut countdown = CountdownSniper::new(target_unix, 50);
+                if let Some(block_ts) = rpc_racer.fetch_latest_block_timestamp().await {
+                    let local_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+                    let offset = CountdownSniper::calculate_offset_from_block_time(block_ts, local_ms);
+                    countdown.set_clock_offset_ms(offset);
+                    state.add_log(format!("⏱️ Calibrated clock against block (ts: {block_ts}, offset: {offset}ms)"));
+                }
+                let offset_ms = countdown.clock_offset_ms();
+                let tx_c = trigger_tx.clone();
+                tokio::spawn(async move { countdown.wait_for_target(tx_c).await; });
+                state.add_log(format!("⏱️ Armed Countdown Sniper for Unix {target_unix} (offset: {offset_ms}ms)"));
+            } else {
+                state.add_log("⚠️ Countdown mode selected but target timestamp is 0 or missing.".to_string());
+            }
         }
-    }
-
-    // 2. Mempool Scanner
-    if let Some(owner) = &config.drop.monitor_owner_address {
-        if !owner.is_empty() && !config.chain.rpc_urls.is_empty() {
-            let scanner = MempoolScanner::new(
-                &config.chain.rpc_urls[0],
+        TriggerMode::Mempool => {
+            let mempool_rpc = config.chain.ws_rpc_url.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(&config.chain.rpc_urls[0]);
+            let scanner = MempoolScanner::with_http_fallback(
+                mempool_rpc,
+                config.chain.rpc_urls.first().cloned(),
                 &target_contract,
-                Some(owner.to_string()),
-                &config.drop.flip_function_signatures,
+                config.drop.monitor_owner_address.clone(),
+                &config.drop.mempool_flip_signatures,
             );
-            let tx_clone = trigger_tx.clone();
-            tokio::spawn(async move {
-                scanner.run_scan_loop(tx_clone).await;
-            });
-            state.add_log(format!("🕵️ Armed Mempool Scanner for Owner {}", owner));
+            let tx_c = trigger_tx.clone();
+            tokio::spawn(async move { scanner.run_scan_loop(tx_c).await; });
+            let owner_info = config.drop.monitor_owner_address.as_deref().unwrap_or("any");
+            state.add_log(format!("🕵️ Armed Mempool Scanner for Owner {owner_info} on {mempool_rpc}"));
+        }
+        TriggerMode::StatePoller => {
+            if !config.drop.flip_function_signatures.is_empty() && !config.chain.rpc_urls.is_empty() {
+                let poller = StatePoller::new(&config.chain.rpc_urls[0], &target_contract, &config.drop.flip_function_signatures);
+                let tx_c = trigger_tx.clone();
+                tokio::spawn(async move { poller.run_poll_loop(tx_c).await; });
+                state.add_log("🔄 Armed On-Chain State Poller".to_string());
+            }
         }
     }
 
-    // 3. State Poller
-    if !config.drop.flip_function_signatures.is_empty() && !config.chain.rpc_urls.is_empty() {
-        let poller = StatePoller::new(
-            &config.chain.rpc_urls[0],
-            &target_contract,
-            &config.drop.flip_function_signatures,
-        );
-        let tx_clone = trigger_tx.clone();
-        tokio::spawn(async move {
-            poller.run_poll_loop(tx_clone).await;
-        });
-        state.add_log("🔄 Armed On-Chain State Poller".to_string());
-    }
-
-    // 4. MEV Builder Client
+    // 2. MEV Builder Client
     // Chain-aware builder routing: Only Ethereum L1 (chain_id == 1, Sepolia 11155111, Goerli 5) support Flashbots/Titan/Beaver
     let is_l1 = config.chain.chain_id == 1 || config.chain.chain_id == 11155111 || config.chain.chain_id == 5;
     let mev_client = if is_l1 && !config.chain.mev_builder_urls.is_empty() {
@@ -255,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    // 5. Network/RPC Checks
+    // 3. Network/RPC Checks
     let endpoints = rpc_racer.endpoints();
     if endpoints.is_empty() {
         println!("❌ FATAL: No valid RPC endpoints found. Please check config.toml.");
@@ -263,12 +264,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     state.add_log(format!("🌐 Active RPC Endpoints: {}", endpoints.len()));
 
-    // 6. Advisory Pre-Flight Simulation (Ensures contract & calldata are valid at boot without deadlocking triggers)
+    // 4. Advisory Pre-Flight Simulation (Ensures contract & calldata are valid at boot without deadlocking triggers)
     let sim_dest = config.drop.get_dispatch_destination(&target_contract);
     let sim_calldata = if config.drop.seadrop_contract.is_some() {
-        config.drop.build_seadrop_calldata(Some(&workers[0].address), 1)
+        config.drop.build_seadrop_calldata(Some(&workers[0].address), config.drop.mint_quantity)
     } else {
-        config.drop.build_calldata_for_caller(Some(&workers[0].address), 1)
+        config.drop.build_calldata_for_caller(Some(&workers[0].address), config.drop.mint_quantity)
     };
     match (sim_calldata, config.drop.mint_value_wei.parse::<u128>()) {
         (Ok(sim_calldata), Ok(sim_val)) => {
@@ -325,21 +326,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut has_fired = false;
 
     #[cfg(unix)]
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            state.add_log(format!("⚠️ Could not bind SIGTERM handler: {e}"));
-            None
-        }
-    };
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     #[cfg(unix)]
-    let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            state.add_log(format!("⚠️ Could not bind SIGHUP handler: {e}"));
-            None
-        }
-    };
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
 
     // Main Event Loop
     while state.is_running {

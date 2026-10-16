@@ -14,6 +14,16 @@ pub struct BuilderOutcome {
     pub error: Option<String>,
 }
 
+/// Helper function to sign payload according to Flashbots / Builder EIP-191 spec:
+/// EIP-191 personal_sign over keccak256(payload_body).
+fn sign_builder_payload(identity: &PrivateKeySigner, body: &str) -> Option<String> {
+    let body_hash = keccak256(body.as_bytes());
+    let eip191_hash = eip191_hash_message(body_hash);
+    let sig = identity.sign_hash_sync(&eip191_hash).ok()?;
+    let addr_hex = format!("{:#x}", identity.address());
+    Some(format!("{}:0x{}", addr_hex, hex::encode(sig.as_bytes())))
+}
+
 pub struct MevBuilderClient {
     client: Client,
     builder_urls: Vec<String>,
@@ -69,16 +79,7 @@ impl MevBuilderClient {
                 });
                 let payload_str = serde_json::to_string(&payload).unwrap_or_default();
 
-                // Helper closure to sign payload according to Flashbots / Builder EIP-191 spec
-                let sign_payload = |identity: &PrivateKeySigner, body: &str| -> Option<String> {
-                    let body_hash = keccak256(body.as_bytes());
-                    let eip191_hash = eip191_hash_message(body_hash);
-                    let sig = identity.sign_hash_sync(&eip191_hash).ok()?;
-                    let addr_hex = format!("{:#x}", identity.address());
-                    Some(format!("{}:0x{}", addr_hex, hex::encode(sig.as_bytes())))
-                };
-
-                let auth_header = sign_payload(&mev_identity, &payload_str);
+                let auth_header = sign_builder_payload(&mev_identity, &payload_str);
                 if let Some(header_val) = auth_header {
                     let req = client.post(&builder_url)
                         .header("X-Flashbots-Signature", header_val)
@@ -102,7 +103,7 @@ impl MevBuilderClient {
                                         "params": [tx_hex]
                                     });
                                     let fallback_str = serde_json::to_string(&fallback_payload).unwrap_or_default();
-                                    let fallback_header = sign_payload(&mev_identity, &fallback_str);
+                                    let fallback_header = sign_builder_payload(&mev_identity, &fallback_str);
 
                                     let mut fb_req = client.post(&builder_url)
                                         .header("Content-Type", "application/json")
@@ -190,6 +191,109 @@ impl MevBuilderClient {
 
         outcomes
     }
+
+    /// Dispatches an atomic MEV bundle (`eth_sendBundle`) targeting a specific block height.
+    /// Transactions in the bundle are executed strictly sequentially without frontrunning or sandwiching.
+    pub async fn send_bundle(&self, raw_txs: &[String], target_block: u64) -> Vec<BuilderOutcome> {
+        let formatted_txs: Vec<String> = raw_txs
+            .iter()
+            .map(|tx| {
+                if tx.starts_with("0x") {
+                    tx.clone()
+                } else {
+                    format!("0x{tx}")
+                }
+            })
+            .collect();
+
+        let block_hex = format!("0x{:x}", target_block);
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_sendBundle",
+            "params": [{
+                "txs": formatted_txs,
+                "blockNumber": block_hex,
+            }]
+        });
+        let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+
+        let mut handles = Vec::new();
+
+        for url in &self.builder_urls {
+            let client = self.client.clone();
+            let builder_url = url.clone();
+            let body_str = payload_str.clone();
+            let mev_identity = self.mev_identity.clone();
+
+            handles.push(tokio::spawn(async move {
+                let start = Instant::now();
+                if let Some(header_val) = sign_builder_payload(&mev_identity, &body_str) {
+                    let req = client.post(&builder_url)
+                        .header("X-Flashbots-Signature", header_val)
+                        .header("Content-Type", "application/json")
+                        .body(body_str);
+
+                    match req.send().await {
+                        Ok(resp) => {
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            if let Ok(body) = resp.json::<Value>().await {
+                                if let Some(err) = body.get("error") {
+                                    BuilderOutcome {
+                                        builder_url,
+                                        duration_ms,
+                                        success: false,
+                                        response: None,
+                                        error: Some(err.to_string()),
+                                    }
+                                } else {
+                                    BuilderOutcome {
+                                        builder_url,
+                                        duration_ms,
+                                        success: true,
+                                        response: body.get("result").map(|r| r.to_string()),
+                                        error: None,
+                                    }
+                                }
+                            } else {
+                                BuilderOutcome {
+                                    builder_url,
+                                    duration_ms,
+                                    success: false,
+                                    response: None,
+                                    error: Some("Failed to decode response".to_string()),
+                                }
+                            }
+                        }
+                        Err(e) => BuilderOutcome {
+                            builder_url,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            success: false,
+                            response: None,
+                            error: Some(e.to_string()),
+                        },
+                    }
+                } else {
+                    BuilderOutcome {
+                        builder_url,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        success: false,
+                        response: None,
+                        error: Some("Failed to sign bundle for builder".to_string()),
+                    }
+                }
+            }));
+        }
+
+        let mut outcomes = Vec::new();
+        for handle in handles {
+            if let Ok(res) = handle.await {
+                outcomes.push(res);
+            }
+        }
+
+        outcomes
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +311,13 @@ mod tests {
         let sig = identity.sign_hash_sync(&eip191_hash).unwrap();
         let recovered = sig.recover_address_from_prehash(&eip191_hash).unwrap();
         assert_eq!(recovered, identity.address());
+    }
+
+    #[test]
+    fn test_sign_builder_payload() {
+        let identity = PrivateKeySigner::random();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"eth_sendBundle","params":[]}"#;
+        let header = super::sign_builder_payload(&identity, body).unwrap();
+        assert!(header.starts_with(&format!("{:#x}:0x", identity.address())));
     }
 }

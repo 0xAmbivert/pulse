@@ -16,8 +16,31 @@ pub struct ChainConfig {
     pub chain_id: u64,
     pub name: String,
     pub rpc_urls: Vec<String>,
+    #[serde(default)]
+    pub ws_rpc_url: Option<String>,
     pub mev_builder_urls: Vec<String>,
     pub rpc_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerMode {
+    #[default]
+    StatePoller,
+    Countdown,
+    Mempool,
+}
+
+fn default_mint_quantity() -> u64 {
+    1
+}
+
+fn default_mempool_flip_signatures() -> Vec<String> {
+    vec![
+        "setPublicSaleActive(bool)".to_string(),
+        "setSaleActive(bool)".to_string(),
+        "flipSaleState()".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,11 +48,17 @@ pub struct DropConfig {
     pub target_contract: String,
     pub mint_function: String,
     pub mint_value_wei: String,
+    #[serde(default = "default_mint_quantity")]
+    pub mint_quantity: u64,
+    #[serde(default)]
+    pub trigger_mode: TriggerMode,
     pub custom_calldata_hex: Option<String>,
     pub target_timestamp: Option<u64>,
     pub target_block: Option<u64>,
     pub monitor_owner_address: Option<String>,
     pub flip_function_signatures: Vec<String>,
+    #[serde(default = "default_mempool_flip_signatures")]
+    pub mempool_flip_signatures: Vec<String>,
     pub seadrop_contract: Option<String>,
     pub seadrop_fee_recipient: Option<String>,
 }
@@ -40,6 +69,8 @@ impl Default for DropConfig {
             target_contract: "0x0000000000000000000000000000000000000000".to_string(),
             mint_function: "mint(uint256)".to_string(),
             mint_value_wei: "0".to_string(),
+            mint_quantity: 1,
+            trigger_mode: TriggerMode::StatePoller,
             custom_calldata_hex: None,
             target_timestamp: None,
             target_block: None,
@@ -49,6 +80,7 @@ impl Default for DropConfig {
                 "publicSaleActive()".to_string(),
                 "saleIsActive()".to_string(),
             ],
+            mempool_flip_signatures: default_mempool_flip_signatures(),
             seadrop_contract: None,
             seadrop_fee_recipient: None,
         }
@@ -74,7 +106,7 @@ fn encode_address_word(caller: Option<&str>) -> Result<[u8; 32], String> {
 
 impl DropConfig {
     pub fn build_calldata(&self) -> Result<Vec<u8>, String> {
-        self.build_calldata_for_caller(None, 1)
+        self.build_calldata_for_caller(None, self.mint_quantity)
     }
 
     /// Builds calldata for `mint(...)`-style signatures. `quantity` is written to any `uint256` argument.
@@ -202,6 +234,7 @@ impl Default for AppConfig {
                     "https://eth.llamarpc.com".to_string(),
                     "https://rpc.payload.de".to_string(),
                 ],
+                ws_rpc_url: None,
                 mev_builder_urls: vec![
                     "https://relay.flashbots.net".to_string(),
                     "https://rpc.titanbuilder.xyz".to_string(),
@@ -212,6 +245,8 @@ impl Default for AppConfig {
                 target_contract: "0x0000000000000000000000000000000000000000".to_string(),
                 mint_function: "mint(uint256)".to_string(),
                 mint_value_wei: "0".to_string(),
+                mint_quantity: 1,
+                trigger_mode: TriggerMode::StatePoller,
                 custom_calldata_hex: None,
                 target_timestamp: None,
                 target_block: None,
@@ -221,6 +256,7 @@ impl Default for AppConfig {
                     "publicSaleActive()".to_string(),
                     "saleIsActive()".to_string(),
                 ],
+                mempool_flip_signatures: default_mempool_flip_signatures(),
                 seadrop_contract: None,
                 seadrop_fee_recipient: None,
             },

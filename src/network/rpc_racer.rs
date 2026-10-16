@@ -265,6 +265,34 @@ impl RpcRacer {
         None
     }
 
+    /// Queries the latest block's timestamp from healthy endpoints.
+    pub async fn fetch_latest_block_timestamp(&self) -> Option<u64> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getBlockByNumber",
+            "params": ["latest", false],
+            "id": 1
+        });
+
+        for ep in &self.endpoints {
+            if !ep.is_healthy {
+                continue;
+            }
+            if let Ok(resp) = self.client.post(&ep.url).json(&payload).send().await {
+                if let Ok(json_body) = resp.json::<Value>().await {
+                    if let Some(ts_hex) = json_body.get("result")
+                        .and_then(|r| r.get("timestamp"))
+                        .and_then(|t| t.as_str()) {
+                        if let Ok(ts) = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16) {
+                            return Some(ts);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Queries the on-chain confirmed transaction count (nonce) for an address.
     pub async fn fetch_transaction_count(&self, address: &str) -> Option<u64> {
         let payload = json!({

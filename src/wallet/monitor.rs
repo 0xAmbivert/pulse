@@ -176,17 +176,19 @@ pub fn spawn_tx_monitor(
                                     let mev_c = mev.clone();
                                     let raw_c = new_raw.clone();
                                     let alerts_c = alerts.clone();
+                                    let racer_fallback = rpc_racer.clone();
                                     tokio::spawn(async move {
                                         let outcomes =
                                             mev_c.send_private_transaction(&raw_c).await;
                                         if !outcomes.iter().any(|o| o.success) {
                                             alerts_c
                                                 .dispatch_alert(
-                                                    "⚠️ All Builders Rejected Speedup",
+                                                    "⚠️ All Builders Rejected Speedup, falling back to public RPC",
                                                     &format!("{:?}", outcomes),
                                                     false,
                                                 )
                                                 .await;
+                                            let _ = racer_fallback.race_broadcast_raw_tx(&raw_c).await;
                                         }
                                     });
                                 } else {

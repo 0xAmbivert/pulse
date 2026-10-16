@@ -8,6 +8,7 @@ use tracing::info;
 
 pub struct MempoolScanner {
     rpc_url: String,
+    http_fallback_url: Option<String>,
     target_contract: String,
     owner_address: Option<String>,
     selectors: Vec<[u8; 4]>,
@@ -16,6 +17,16 @@ pub struct MempoolScanner {
 impl MempoolScanner {
     pub fn new(
         rpc_url: &str,
+        target_contract: &str,
+        owner_address: Option<String>,
+        signature_names: &[String],
+    ) -> Self {
+        Self::with_http_fallback(rpc_url, None, target_contract, owner_address, signature_names)
+    }
+
+    pub fn with_http_fallback(
+        rpc_url: &str,
+        http_fallback_url: Option<String>,
         target_contract: &str,
         owner_address: Option<String>,
         signature_names: &[String],
@@ -34,6 +45,7 @@ impl MempoolScanner {
 
         Self {
             rpc_url: rpc_url.to_string(),
+            http_fallback_url,
             target_contract: target_contract.to_lowercase(),
             owner_address: owner_address.map(|a| a.to_lowercase()),
             selectors,
@@ -75,11 +87,13 @@ impl MempoolScanner {
 
         let mut backoff_ms = 1000u64;
         let mut is_reconnect = false;
-        let http_url = if self.rpc_url.starts_with("wss://") {
-            self.rpc_url.replacen("wss://", "https://", 1)
-        } else {
-            self.rpc_url.replacen("ws://", "http://", 1)
-        };
+        let http_url = self.http_fallback_url.clone().unwrap_or_else(|| {
+            if self.rpc_url.starts_with("wss://") {
+                self.rpc_url.replacen("wss://", "https://", 1)
+            } else {
+                self.rpc_url.replacen("ws://", "http://", 1)
+            }
+        });
 
         loop {
             match tokio_tungstenite::connect_async(&self.rpc_url).await {
@@ -313,10 +327,10 @@ mod tests {
 
     #[test]
     fn test_mempool_matches_selector() {
-        let sigs = vec!["isPublicSaleActive()".to_string(), "saleIsActive()".to_string()];
+        let sigs = vec!["setPublicSaleActive(bool)".to_string(), "flipSaleState()".to_string()];
         let scanner = MempoolScanner::new("http://localhost:8545", "0x0000000000000000000000000000000000000000", None, &sigs);
 
-        let hash = alloy::primitives::keccak256("isPublicSaleActive()".as_bytes());
+        let hash = alloy::primitives::keccak256("setPublicSaleActive(bool)".as_bytes());
         let selector_hex = format!("0x{}", hex::encode(&hash[0..4]));
         assert!(scanner.matches_selector(&selector_hex));
 

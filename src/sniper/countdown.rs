@@ -29,6 +29,20 @@ impl CountdownSniper {
         }
     }
 
+    pub fn set_clock_offset_ms(&mut self, clock_offset_ms: i64) {
+        self.clock_offset_ms = clock_offset_ms;
+    }
+
+    pub fn clock_offset_ms(&self) -> i64 {
+        self.clock_offset_ms
+    }
+
+    /// Calculates clock offset from latest on-chain block timestamp against local system time.
+    /// Returns offset in milliseconds: positive if local clock is behind block time, negative if ahead.
+    pub fn calculate_offset_from_block_time(block_timestamp_secs: u64, local_time_ms: i64) -> i64 {
+        (block_timestamp_secs as i64 * 1000) - local_time_ms
+    }
+
     /// Runs countdown loop until target timestamp (minus lead_time_ms), then triggers the dispatch channel.
     pub async fn wait_for_target(&self, tx: mpsc::Sender<SnipeTrigger>) {
         loop {
@@ -72,5 +86,17 @@ mod tests {
         sniper.wait_for_target(tx).await;
         let received = rx.recv().await.unwrap();
         assert!(matches!(received, SnipeTrigger::CountdownReached { target_unix } if target_unix == past_timestamp));
+    }
+
+    #[test]
+    fn test_clock_offset_calculation() {
+        let block_ts = 1_700_000_000u64;
+        let local_ms = 1_699_999_998_000i64; // local clock is 2 seconds behind
+        let offset = CountdownSniper::calculate_offset_from_block_time(block_ts, local_ms);
+        assert_eq!(offset, 2000);
+
+        let mut sniper = CountdownSniper::new(block_ts, 50);
+        sniper.set_clock_offset_ms(offset);
+        assert_eq!(sniper.clock_offset_ms(), 2000);
     }
 }

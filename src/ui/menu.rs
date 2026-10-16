@@ -198,9 +198,27 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                     println!("❌ Invalid mint value '{trimmed}'. Enter an integer number of Wei (e.g. 0).");
                 };
 
-                // 6. Max Gas Fee in Gwei (Optional: Enter for default). Invalid input re-prompts.
+                // 6. Mint Quantity (Optional: Enter for default). Invalid input re-prompts.
+                let default_qty = base_config.drop.mint_quantity;
+                let mint_quantity = loop {
+                    print!("6️⃣  Enter Mint Quantity (Press Enter for '{}'): ", default_qty);
+                    io::stdout().flush()?;
+                    let Some(qty_input) = read_line_opt()? else {
+                        return Ok(MenuAction::Exit);
+                    };
+                    let trimmed = qty_input.trim();
+                    if trimmed.is_empty() {
+                        break default_qty;
+                    }
+                    match trimmed.parse::<u64>() {
+                        Ok(q) if q > 0 => break q,
+                        _ => println!("❌ Invalid quantity '{trimmed}'. Enter a positive integer."),
+                    }
+                };
+
+                // 7. Max Gas Fee in Gwei (Optional: Enter for default). Invalid input re-prompts.
                 let max_gas_fee = loop {
-                    print!("6⃣  Enter Max Gas Fee in Gwei (Press Enter for '{:.1}'): ", base_config.gas.max_fee_gwei);
+                    print!("7️⃣  Enter Max Gas Fee in Gwei (Press Enter for '{:.1}'): ", base_config.gas.max_fee_gwei);
                     io::stdout().flush()?;
                     let Some(gas_input) = read_line_opt()? else {
                         return Ok(MenuAction::Exit);
@@ -215,7 +233,7 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                     }
                 };
 
-                // 7. Snipe Trigger Mode Selection
+                // 8. Snipe Trigger Mode Selection
                 println!("\n🎯 Select Sniping Trigger Mode:");
                 println!("   a) Instant / State Poller (Watches when contract sale flips active)");
                 println!("   b) Countdown Timer (Target Unix timestamp)");
@@ -228,8 +246,7 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
 
                 let mut target_timestamp = None;
                 let mut monitor_owner_address = None;
-
-                match trigger_choice.trim().to_lowercase().as_str() {
+                let trigger_mode = match trigger_choice.trim().to_lowercase().as_str() {
                     "b" => {
                         print!("   Enter Target Unix Timestamp: ");
                         io::stdout().flush()?;
@@ -237,6 +254,7 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                             return Ok(MenuAction::Exit);
                         };
                         target_timestamp = ts_str.trim().parse::<u64>().ok();
+                        crate::config::TriggerMode::Countdown
                     }
                     "c" => {
                         print!("   Enter Owner Address to Monitor: ");
@@ -247,9 +265,10 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                         if !owner_str.trim().is_empty() {
                             monitor_owner_address = Some(owner_str.trim().to_string());
                         }
+                        crate::config::TriggerMode::Mempool
                     }
-                    _ => {}
-                }
+                    _ => crate::config::TriggerMode::StatePoller,
+                };
 
                 // Construct session configuration strictly in memory (NEVER saved to file)
                 let mut session_config = base_config.clone();
@@ -257,6 +276,8 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 session_config.drop.target_contract = target_addr;
                 session_config.drop.mint_function = mint_function;
                 session_config.drop.mint_value_wei = mint_value_wei;
+                session_config.drop.mint_quantity = mint_quantity;
+                session_config.drop.trigger_mode = trigger_mode;
                 session_config.drop.target_timestamp = target_timestamp;
                 session_config.drop.monitor_owner_address = monitor_owner_address;
                 session_config.drop.seadrop_contract = seadrop_contract;
@@ -362,7 +383,10 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                                 if let Some(ref sd) = report.seadrop_config {
                                     if sd.start_time > now {
                                         session_config.drop.target_timestamp = Some(sd.start_time);
+                                        session_config.drop.trigger_mode = crate::config::TriggerMode::Countdown;
                                         println!("⏱️ Pre-configured countdown timer to start time: {}", sd.start_time);
+                                    } else {
+                                        session_config.drop.trigger_mode = crate::config::TriggerMode::StatePoller;
                                     }
                                 }
 
