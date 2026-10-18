@@ -54,11 +54,7 @@ fn prepare_snipes(
     let destination = config.drop.get_dispatch_destination(target_contract);
 
     for worker in workers {
-        let calldata = if config.drop.seadrop_contract.is_some() {
-            config.drop.build_seadrop_calldata(Some(&worker.address), config.drop.mint_quantity)?
-        } else {
-            config.drop.build_calldata_for_caller(Some(&worker.address), config.drop.mint_quantity)?
-        };
+        let calldata = config.drop.build_dispatch_calldata(Some(&worker.address), config.drop.mint_quantity)?;
         let nonce = worker.nonce_mgr.current();
         let (raw_tx, n) = worker.build_and_sign_eip1559(
             config.chain.chain_id,
@@ -198,6 +194,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let target_contract = config.drop.target_contract.clone();
     let rpc_racer_clone = rpc_racer.clone();
 
+    // Pre-flight wallet balance check: balance >= value_wei + (gas_limit * max_fee_wei)
+    let max_fee_wei = pulse::gas::gwei_to_wei(effective_cap_gwei);
+    let mint_val_wei = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
+    let needed_wei = mint_val_wei.saturating_add((config.gas.gas_limit as u128).saturating_mul(max_fee_wei));
+    for w in &workers {
+        if let Some(bal) = rpc_racer.fetch_balance(&w.address).await {
+            if bal < needed_wei {
+                let deficit_eth = (needed_wei - bal) as f64 / 1e18;
+                state.add_log(format!("⚠️ Insufficient balance for {}: deficit {:.6} ETH", w.address, deficit_eth));
+            } else {
+                state.add_log(format!("💰 Wallet {} balance verified: {:.4} ETH", w.address, bal as f64 / 1e18));
+            }
+        }
+    }
+
     // 🔥 WIRING UP ALL SNIPERS & ENGINES TO FIX DEAD ENDS 🔥
 
     // 1. Exclusive Trigger Mode Spawning
@@ -266,11 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 4. Advisory Pre-Flight Simulation (Ensures contract & calldata are valid at boot without deadlocking triggers)
     let sim_dest = config.drop.get_dispatch_destination(&target_contract);
-    let sim_calldata = if config.drop.seadrop_contract.is_some() {
-        config.drop.build_seadrop_calldata(Some(&workers[0].address), config.drop.mint_quantity)
-    } else {
-        config.drop.build_calldata_for_caller(Some(&workers[0].address), config.drop.mint_quantity)
-    };
+    let sim_calldata = config.drop.build_dispatch_calldata(Some(&workers[0].address), config.drop.mint_quantity);
     match (sim_calldata, config.drop.mint_value_wei.parse::<u128>()) {
         (Ok(sim_calldata), Ok(sim_val)) => {
             let simulator = RpcSimulator::new(&endpoints[0].url);

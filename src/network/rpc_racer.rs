@@ -319,6 +319,32 @@ impl RpcRacer {
         None
     }
 
+    /// Queries the on-chain balance in Wei for an address using eth_getBalance.
+    pub async fn fetch_balance(&self, address: &str) -> Option<u128> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getBalance",
+            "params": [address, "latest"],
+            "id": 1
+        });
+
+        for ep in &self.endpoints {
+            if !ep.is_healthy {
+                continue;
+            }
+            if let Ok(resp) = self.client.post(&ep.url).json(&payload).send().await {
+                if let Ok(json_body) = resp.json::<Value>().await {
+                    if let Some(bal_hex) = json_body.get("result").and_then(|r| r.as_str()) {
+                        if let Ok(bal) = u128::from_str_radix(bal_hex.trim_start_matches("0x"), 16) {
+                            return Some(bal);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn endpoints(&self) -> &[RpcEndpoint] {
         &self.endpoints
     }

@@ -4,6 +4,8 @@ use std::time::Duration;
 use crate::eligibility::types::SeaDropPublicConfig;
 
 pub const SEADROP_V1_ADDRESS: &str = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
+pub const SEADROP_MINT_PUBLIC_SELECTOR: [u8; 4] = [0x16, 0x1a, 0xc2, 0x1f];
+pub const SEADROP_MINT_ALLOWLIST_SELECTOR: [u8; 4] = [0x7b, 0x23, 0x3a, 0x75];
 
 pub struct SeaDropInspector {
     rpc_url: String,
@@ -75,6 +77,21 @@ impl SeaDropInspector {
         }
         let first = word(len_word + 1)?;
         Some(format!("0x{}", &first[24..]))
+    }
+
+    /// Queries getAllowListMerkleRoot(address) on SeaDrop (selector 0x32bf11f5).
+    pub async fn fetch_allowlist_merkle_root(&self, nft_contract: &str) -> Option<String> {
+        let clean = nft_contract.trim().trim_start_matches("0x").to_lowercase();
+        let calldata = format!("0x32bf11f5{:0>64}", clean);
+        let res = self.eth_call(&self.seadrop_address, &calldata, "0x0").await.ok()?;
+        let hex_res = res.trim_start_matches("0x");
+        if hex_res.len() >= 64 {
+            let root = &hex_res[0..64];
+            if root != "0".repeat(64) {
+                return Some(format!("0x{root}"));
+            }
+        }
+        None
     }
 
     /// Queries getMintStats(address minter) on the NFT contract.

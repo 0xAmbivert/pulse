@@ -270,6 +270,29 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                     _ => crate::config::TriggerMode::StatePoller,
                 };
 
+                // 9. Merkle Proof Hashes (for allowlist / whitelist drops)
+                let is_allowlist = mint_function.contains("bytes32[]")
+                    || mint_function.to_lowercase().contains("whitelist")
+                    || mint_function.to_lowercase().contains("allowlist")
+                    || seadrop_contract.is_some();
+                let mut merkle_proof = base_config.drop.merkle_proof.clone();
+                if is_allowlist {
+                    print!("📜 Enter Merkle Proof hashes (comma-separated hex or press Enter to skip): ");
+                    io::stdout().flush()?;
+                    if let Some(proof_str) = read_line_opt()? {
+                        let hashes: Vec<String> = proof_str
+                            .split(',')
+                            .map(|s| s.trim().trim_start_matches("0x").to_string())
+                            .filter(|s| s.len() == 64 && hex::decode(s).is_ok())
+                            .map(|s| format!("0x{s}"))
+                            .collect();
+                        if !hashes.is_empty() {
+                            println!("✅ Loaded {} valid Merkle proof hash(es).", hashes.len());
+                            merkle_proof = hashes;
+                        }
+                    }
+                }
+
                 // Construct session configuration strictly in memory (NEVER saved to file)
                 let mut session_config = base_config.clone();
                 session_config.chain.rpc_urls = rpc_urls;
@@ -278,6 +301,7 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 session_config.drop.mint_value_wei = mint_value_wei;
                 session_config.drop.mint_quantity = mint_quantity;
                 session_config.drop.trigger_mode = trigger_mode;
+                session_config.drop.merkle_proof = merkle_proof;
                 session_config.drop.target_timestamp = target_timestamp;
                 session_config.drop.monitor_owner_address = monitor_owner_address;
                 session_config.drop.seadrop_contract = seadrop_contract;
@@ -390,11 +414,38 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                                     }
                                 }
 
+                                let has_allowlist = report.stages.iter().any(|s| {
+                                    s.stage_type.to_lowercase().contains("allowlist")
+                                        || s.stage_type.to_lowercase().contains("whitelist")
+                                        || s.label.to_lowercase().contains("allowlist")
+                                        || s.label.to_lowercase().contains("whitelist")
+                                });
+                                if has_allowlist || report.drop_mechanism.contains("SeaDrop") {
+                                    print!("📜 Enter Merkle Proof hashes (comma-separated hex or press Enter to skip): ");
+                                    io::stdout().flush()?;
+                                    if let Some(proof_str) = read_line_opt()? {
+                                        let hashes: Vec<String> = proof_str
+                                            .split(',')
+                                            .map(|s| s.trim().trim_start_matches("0x").to_string())
+                                            .filter(|s| s.len() == 64 && hex::decode(s).is_ok())
+                                            .map(|s| format!("0x{s}"))
+                                            .collect();
+                                        if !hashes.is_empty() {
+                                            println!("✅ Loaded {} valid Merkle proof hash(es).", hashes.len());
+                                            session_config.drop.merkle_proof = hashes;
+                                        }
+                                    }
+                                }
+
                                 if report.drop_mechanism.contains("SeaDrop") {
                                     session_config.drop.seadrop_contract = Some(crate::eligibility::seadrop::SEADROP_V1_ADDRESS.to_string());
                                     session_config.drop.seadrop_fee_recipient = report.seadrop_config.as_ref().and_then(|s| s.fee_recipient.clone())
                                         .or(report.target.fee_recipient.clone());
-                                    session_config.drop.mint_function = "mintPublic(address,address,address,uint256)".to_string();
+                                    if !session_config.drop.merkle_proof.is_empty() {
+                                        session_config.drop.mint_function = "mintAllowList(address,address,address,(uint256,uint256,uint256,uint256,uint256,uint256,uint16,bool),bytes32[])".to_string();
+                                    } else {
+                                        session_config.drop.mint_function = "mintPublic(address,address,address,uint256)".to_string();
+                                    }
                                 }
 
                                 println!("\n🚀 Loading verified drop into sniper. Booting engine...");
