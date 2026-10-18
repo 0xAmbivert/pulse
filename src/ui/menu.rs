@@ -49,6 +49,27 @@ fn parse_hex_hashes(input: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_keys_from_input(input: String) -> Result<Vec<ProtectedKey>, String> {
+    let pk_guard = zeroize::Zeroizing::new(input);
+    let raw_keys: Vec<&str> = pk_guard
+        .as_str()
+        .split(',')
+        .map(|s| s.trim().trim_start_matches("0x"))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if raw_keys.is_empty() {
+        return Err("No private keys provided.".to_string());
+    }
+    let mut keys = Vec::with_capacity(raw_keys.len());
+    for k in raw_keys {
+        if k.len() != 64 {
+            return Err(format!("Invalid key length ({} chars). Each must be 64 hex characters.", k.len()));
+        }
+        keys.push(ProtectedKey::from_hex(k).map_err(|e| format!("Invalid hex key: {e}"))?);
+    }
+    Ok(keys)
+}
+
 /// Displays the interactive CLI menu and returns the ephemeral session configuration.
 pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction, Box<dyn std::error::Error + Send + Sync>> {
     loop {
@@ -79,39 +100,13 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                         continue;
                     }
                 };
-                let pk_guard = zeroize::Zeroizing::new(pk_input);
-                let raw_keys: Vec<&str> = pk_guard
-                    .as_str()
-                    .split(',')
-                    .map(|s| s.trim().trim_start_matches("0x"))
-                    .filter(|s| !s.is_empty())
-                    .collect();
-
-                if raw_keys.is_empty() {
-                    println!("❌ No private keys provided.");
-                    continue;
-                }
-
-                let mut keys = Vec::new();
-                let mut parse_failed = false;
-                for k in raw_keys {
-                    if k.len() != 64 {
-                        println!("❌ Invalid private key length ({} chars). Each must be 64 hex characters.", k.len());
-                        parse_failed = true;
-                        break;
+                let keys = match parse_keys_from_input(pk_input) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        println!("❌ {e}");
+                        continue;
                     }
-                    match ProtectedKey::from_hex(k) {
-                        Ok(key) => keys.push(key),
-                        Err(e) => {
-                            println!("❌ Invalid hex key: {}", e);
-                            parse_failed = true;
-                            break;
-                        }
-                    }
-                }
-                if parse_failed || keys.is_empty() {
-                    continue;
-                }
+                };
                 println!("🔑 Successfully parsed {} ephemeral wallet key(s) into RAM.", keys.len());
 
                 // 2. Target Contract Address or OpenSea URL
@@ -128,22 +123,29 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
 
                 // If user entered an OpenSea URL, resolve it automatically!
                 let mut auto_merkle_proof = Vec::new();
+                let mut resolved_chain_id = None;
                 let (target_addr, mut detected_mint_func, mut detected_price_wei) = if let Some(slug) = OpenSeaClient::extract_slug(&target_input) {
                     println!("🔎 Resolving OpenSea collection slug: '{slug}'...");
                     let mut opensea = OpenSeaClient::new();
                     match opensea.fetch_collection_by_slug(&slug).await {
                         Ok(resolved) => {
-                            println!("✅ Resolved OpenSea drop: '{}' -> {}", resolved.collection_name, resolved.contract_address);
-                            println!("🔑 Self-authenticating with OpenSea via SIWE (EIP-4361)...");
-                            if opensea.authenticate_with_key(&keys[0], base_config.chain.chain_id).await.is_ok() {
-                                println!("✅ OpenSea SIWE session authenticated.");
-                                if let Ok(addr) = crate::crypto::get_address_from_protected(&keys[0]) {
-                                    if let Ok(elig) = opensea.fetch_drop_eligibility(&slug, &addr).await {
-                                        if !elig.merkle_proof.is_empty() {
-                                            println!("📜 Auto-loaded {} allowlist Merkle proof hash(es) from OpenSea!", elig.merkle_proof.len());
-                                            auto_merkle_proof = elig.merkle_proof;
+                            println!("✅ Resolved OpenSea drop: '{}' -> {} (Chain: {})", resolved.collection_name, resolved.contract_address, resolved.chain);
+                            resolved_chain_id = Some(resolved.chain_id);
+                            println!("🔑 Attempting OpenSea SIWE auto-auth...");
+                            match opensea.authenticate_with_key(&keys[0], resolved.chain_id).await {
+                                Ok(_) => {
+                                    println!("✅ OpenSea SIWE session authenticated.");
+                                    if let Ok(addr) = crate::crypto::get_address_from_protected(&keys[0]) {
+                                        if let Ok(elig) = opensea.fetch_drop_eligibility(&slug, &addr).await {
+                                            if !elig.merkle_proof.is_empty() {
+                                                println!("📜 Auto-loaded {} allowlist Merkle proof hash(es) from OpenSea!", elig.merkle_proof.len());
+                                                auto_merkle_proof = elig.merkle_proof;
+                                            }
                                         }
                                     }
+                                }
+                                Err(e) => {
+                                    println!("ℹ️ OpenSea automated SIWE auth unavailable ({e}). Fallback to manual Merkle proofs if required.");
                                 }
                             }
                             (resolved.contract_address, None, None)
@@ -302,6 +304,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
 
                 // Construct session configuration strictly in memory (NEVER saved to file)
                 let mut session_config = base_config.clone();
+                if let Some(cid) = resolved_chain_id {
+                    session_config.chain.chain_id = cid;
+                }
                 session_config.chain.rpc_urls = rpc_urls;
                 session_config.drop.target_contract = target_addr;
                 session_config.drop.mint_function = mint_function;
@@ -384,83 +389,88 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                             return Ok(MenuAction::Exit);
                         };
                         if launch_in.trim().eq_ignore_ascii_case("y") {
-                            println!("\n🔒 Paste your raw private key (Hex) to arm RAM sniper:");
-                            let pk_input = match read_private_key("1️⃣  Paste raw private key (Hex): ") {
+                            println!("\n🔒 Paste your raw private key(s) (Hex, comma-separated for multi-wallet):");
+                            let pk_input = match read_private_key("1️⃣  Paste raw private key(s) (Hex): ") {
                                 Ok(Some(p)) => p,
                                 Ok(None) => return Ok(MenuAction::Exit),
                                 Err(e) => {
-                                    println!("❌ Failed to read private key: {}. Returning to menu.", e);
+                                    println!("❌ Failed to read private key: {e}. Returning to menu.");
                                     continue;
                                 }
                             };
-                            let pk_guard = zeroize::Zeroizing::new(pk_input);
-                            let clean_hex = pk_guard.as_str().trim().trim_start_matches("0x");
-                            if let Ok(key) = ProtectedKey::from_hex(clean_hex) {
-                                let mut session_config = base_config.clone();
-                                session_config.chain.chain_id = report.target.chain_id;
-                                // Keep the fallback pool; the user's RPC goes first.
-                                let mut pool = vec![rpc_url];
-                                for url in &base_config.chain.rpc_urls {
-                                    if !pool.contains(url) {
-                                        pool.push(url.clone());
-                                    }
+                            let keys = match parse_keys_from_input(pk_input) {
+                                Ok(k) => k,
+                                Err(e) => {
+                                    println!("❌ {e}. Returning to menu.");
+                                    continue;
                                 }
-                                session_config.chain.rpc_urls = pool;
-                                session_config.drop.target_contract = report.target.contract_address.clone();
-                                session_config.drop.mint_value_wei = report.wallet_status.price_wei.to_string();
-
-                                // Pre-fill countdown timer if drop is upcoming
-                                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                                if let Some(ref sd) = report.seadrop_config {
-                                    if sd.start_time > now {
-                                        session_config.drop.target_timestamp = Some(sd.start_time);
-                                        session_config.drop.trigger_mode = crate::config::TriggerMode::Countdown;
-                                        println!("⏱️ Pre-configured countdown timer to start time: {}", sd.start_time);
-                                    } else {
-                                        session_config.drop.trigger_mode = crate::config::TriggerMode::StatePoller;
-                                    }
+                            };
+                            let mut session_config = base_config.clone();
+                            session_config.chain.chain_id = report.target.chain_id;
+                            // Keep the fallback pool; the user's RPC goes first.
+                            let mut pool = vec![rpc_url];
+                            for url in &base_config.chain.rpc_urls {
+                                if !pool.contains(url) {
+                                    pool.push(url.clone());
                                 }
-
-                                let has_allowlist = report.stages.iter().any(|s| {
-                                    s.stage_type.to_lowercase().contains("allowlist")
-                                        || s.stage_type.to_lowercase().contains("whitelist")
-                                        || s.label.to_lowercase().contains("allowlist")
-                                        || s.label.to_lowercase().contains("whitelist")
-                                });
-                                if let Some(ref oe) = report.opensea_eligibility {
-                                    if !oe.merkle_proof.is_empty() {
-                                        session_config.drop.merkle_proof = oe.merkle_proof.clone();
-                                        println!("📜 Pre-loaded {} Merkle proof hash(es) from OpenSea report.", oe.merkle_proof.len());
-                                    }
-                                }
-                                if session_config.drop.merkle_proof.is_empty() && (has_allowlist || report.drop_mechanism.contains("SeaDrop")) {
-                                    print!("📜 Enter Merkle Proof hashes (comma-separated hex or press Enter to skip): ");
-                                    io::stdout().flush()?;
-                                    if let Some(proof_str) = read_line_opt()? {
-                                        let hashes = parse_hex_hashes(&proof_str);
-                                        if !hashes.is_empty() {
-                                            println!("✅ Loaded {} valid Merkle proof hash(es).", hashes.len());
-                                            session_config.drop.merkle_proof = hashes;
-                                        }
-                                    }
-                                }
-
-                                if report.drop_mechanism.contains("SeaDrop") {
-                                    session_config.drop.seadrop_contract = Some(crate::eligibility::seadrop::SEADROP_V1_ADDRESS.to_string());
-                                    session_config.drop.seadrop_fee_recipient = report.seadrop_config.as_ref().and_then(|s| s.fee_recipient.clone())
-                                        .or(report.target.fee_recipient.clone());
-                                    if !session_config.drop.merkle_proof.is_empty() {
-                                        session_config.drop.mint_function = "mintAllowList(address,address,address,(uint256,uint256,uint256,uint256,uint256,uint256,uint16,bool),bytes32[])".to_string();
-                                    } else {
-                                        session_config.drop.mint_function = "mintPublic(address,address,address,uint256)".to_string();
-                                    }
-                                }
-
-                                println!("\n🚀 Loading verified drop into sniper. Booting engine...");
-                                return Ok(MenuAction::Start { keys: vec![key], session_config: Box::new(session_config) });
-                            } else {
-                                println!("❌ Invalid private key. Returning to menu.");
                             }
+                            session_config.chain.rpc_urls = pool;
+                            session_config.drop.target_contract = report.target.contract_address.clone();
+                            session_config.drop.mint_value_wei = report.wallet_status.price_wei.to_string();
+
+                            // Pre-fill countdown timer if drop is upcoming
+                            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                            if let Some(ref sd) = report.seadrop_config {
+                                session_config.drop.allowlist_end_time = Some(sd.end_time);
+                                session_config.drop.allowlist_fee_bps = Some(sd.fee_bps);
+                                session_config.drop.allowlist_wallet_limit = Some(sd.max_per_wallet);
+                                if sd.start_time > now {
+                                    session_config.drop.target_timestamp = Some(sd.start_time);
+                                    session_config.drop.trigger_mode = crate::config::TriggerMode::Countdown;
+                                    println!("⏱️ Pre-configured countdown timer to start time: {}", sd.start_time);
+                                } else {
+                                    session_config.drop.trigger_mode = crate::config::TriggerMode::StatePoller;
+                                }
+                            }
+
+                            let has_allowlist = report.stages.iter().any(|s| {
+                                s.stage_type.to_lowercase().contains("allowlist")
+                                    || s.stage_type.to_lowercase().contains("whitelist")
+                                    || s.label.to_lowercase().contains("allowlist")
+                                    || s.label.to_lowercase().contains("whitelist")
+                            });
+                            if let Some(ref oe) = report.opensea_eligibility {
+                                if !oe.merkle_proof.is_empty() {
+                                    session_config.drop.merkle_proof = oe.merkle_proof.clone();
+                                    session_config.drop.allowlist_wallet_limit = oe.max_mintable;
+                                    println!("📜 Pre-loaded {} Merkle proof hash(es) from OpenSea report.", oe.merkle_proof.len());
+                                }
+                            }
+                            if session_config.drop.merkle_proof.is_empty() && (has_allowlist || report.drop_mechanism.contains("SeaDrop")) {
+                                print!("📜 Enter Merkle Proof hashes (comma-separated hex or press Enter to skip): ");
+                                io::stdout().flush()?;
+                                if let Some(proof_str) = read_line_opt()? {
+                                    let hashes = parse_hex_hashes(&proof_str);
+                                    if !hashes.is_empty() {
+                                        println!("✅ Loaded {} valid Merkle proof hash(es).", hashes.len());
+                                        session_config.drop.merkle_proof = hashes;
+                                    }
+                                }
+                            }
+
+                            if report.drop_mechanism.contains("SeaDrop") {
+                                session_config.drop.seadrop_contract = Some(crate::eligibility::seadrop::SEADROP_V1_ADDRESS.to_string());
+                                session_config.drop.seadrop_fee_recipient = report.seadrop_config.as_ref().and_then(|s| s.fee_recipient.clone())
+                                    .or(report.target.fee_recipient.clone());
+                                if !session_config.drop.merkle_proof.is_empty() {
+                                    session_config.drop.mint_function = "mintAllowList(address,address,address,(uint256,uint256,uint256,uint256,uint256,uint256,uint16,bool),bytes32[])".to_string();
+                                } else {
+                                    session_config.drop.mint_function = "mintPublic(address,address,address,uint256)".to_string();
+                                }
+                            }
+
+                            println!("\n🚀 Loading verified drop into sniper. Booting engine...");
+                            return Ok(MenuAction::Start { keys, session_config: Box::new(session_config) });
                         }
                     }
                     Err(e) => {

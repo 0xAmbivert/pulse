@@ -38,46 +38,23 @@ fn prepare_snipes(
     prev_base_fee_wei: Option<u128>,
     gas_engine: &GasEngine,
 ) -> Result<Vec<PreparedSnipe>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut snipes = Vec::new();
-    let (max_fee_wei, max_priority_fee_wei) = gas_engine.calculate_dynamic_fees_with_acceleration(
-        current_base_fee_wei,
-        prev_base_fee_wei,
-        1,
-        None,
-    )?;
-    let value = config
-        .drop
-        .mint_value_wei
-        .parse::<u128>()
+    let mut snipes = Vec::with_capacity(workers.len());
+    let (max_fee_wei, max_prio_wei) = gas_engine.calculate_dynamic_fees_with_acceleration(current_base_fee_wei, prev_base_fee_wei, 1, None)?;
+    let value = config.drop.mint_value_wei.parse::<u128>()
         .map_err(|e| format!("Invalid mint value in wei '{}': {e}", config.drop.mint_value_wei))?;
-
     let destination = config.drop.get_dispatch_destination(target_contract);
 
     for worker in workers {
         let calldata = config.drop.build_dispatch_calldata(Some(&worker.address), config.drop.mint_quantity)?;
         let nonce = worker.nonce_mgr.current();
         let (raw_tx, n) = worker.build_and_sign_eip1559(
-            config.chain.chain_id,
-            destination,
-            &calldata,
-            value,
-            config.gas.gas_limit,
-            max_fee_wei,
-            max_priority_fee_wei,
-            Some(nonce),
+            config.chain.chain_id, destination, &calldata, value, config.gas.gas_limit, max_fee_wei, max_prio_wei, Some(nonce),
         )?;
         let tx_bytes = hex::decode(raw_tx.trim_start_matches("0x"))
             .map_err(|e| format!("Signed transaction is not valid hex: {e}"))?;
         let tx_hash = format!("{:#x}", alloy::primitives::keccak256(&tx_bytes));
         snipes.push(PreparedSnipe {
-            worker: worker.clone(),
-            raw_tx,
-            tx_hash,
-            nonce: n,
-            max_fee_wei,
-            priority_fee_wei: max_priority_fee_wei,
-            calldata,
-            value_wei: value,
+            worker: worker.clone(), raw_tx, tx_hash, nonce: n, max_fee_wei, priority_fee_wei: max_prio_wei, calldata, value_wei: value,
         });
     }
     Ok(snipes)
@@ -89,6 +66,9 @@ struct Cli {
     /// Path to configuration file
     #[arg(short, long, value_name = "FILE", default_value = "config.toml")]
     config: PathBuf,
+    /// Run in headless mode without interactive TUI
+    #[arg(long)]
+    headless: bool,
 }
 
 #[tokio::main]
@@ -96,20 +76,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
     pulse::crypto::harden_process();
 
-    // Initialize file-backed tracing so logs/warnings are preserved without interfering with TUI
-    let mut log_opts = std::fs::OpenOptions::new();
-    log_opts.create(true).append(true);
     #[cfg(unix)]
-    {
+    let log_opts = {
         use std::os::unix::fs::OpenOptionsExt;
-        log_opts.mode(0o600);
-    }
+        let mut o = std::fs::OpenOptions::new();
+        o.create(true).append(true).mode(0o600);
+        o
+    };
+    #[cfg(not(unix))]
+    let log_opts = { let mut o = std::fs::OpenOptions::new(); o.create(true).append(true); o };
     if let Ok(log_file) = log_opts.open("/tmp/pulse.log") {
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(std::sync::Mutex::new(log_file))
-            .with_ansi(false)
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
+        let sub = tracing_subscriber::fmt().with_writer(std::sync::Mutex::new(log_file)).with_ansi(false).finish();
+        let _ = tracing::subscriber::set_global_default(sub);
     }
 
     // Create default config silently if it doesn't exist so load won't fail
@@ -149,25 +127,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     use std::io::IsTerminal;
-    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
-        println!("✅ Wallet and network components successfully verified!");
-        println!("ℹ️ The dashboard requires an interactive TTY.");
-        println!("🚀 Run directly in your terminal: ./target/release/pulse");
+    let is_piped = std::env::var("PULSE_ALLOW_PIPED_KEY").as_deref() == Ok("1");
+    let is_tty = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+    let headless = cli.headless || (!is_tty && is_piped);
+
+    if !is_tty && !headless {
+        println!("ℹ️ The interactive dashboard requires a TTY. Set PULSE_ALLOW_PIPED_KEY=1 or pass --headless.");
         return Ok(());
     }
 
-    // Setup Terminal UI
     std::panic::set_hook(Box::new(|info| {
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
         let _ = ratatui::crossterm::ExecutableCommand::execute(&mut std::io::stdout(), ratatui::crossterm::terminal::LeaveAlternateScreen);
         eprintln!("{}", info);
     }));
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    stdout.execute(EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    if !headless {
+        enable_raw_mode()?;
+        io::stdout().execute(EnterAlternateScreen)?;
+    }
+    let mut terminal = if !headless {
+        Some(Terminal::new(CrosstermBackend::new(io::stdout()))?)
+    } else {
+        println!("🤖 Headless mode active: streaming event logs directly to console...");
+        None
+    };
 
     let mut state = DashboardState::new(config.drop.target_contract.clone());
     state.active_wallets = workers.len();
@@ -216,17 +200,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         TriggerMode::Countdown => {
             let target_unix = config.drop.target_timestamp.unwrap_or(0);
             if target_unix > 0 {
-                let mut countdown = CountdownSniper::new(target_unix, 50);
-                if let Some(block_ts) = rpc_racer.fetch_latest_block_timestamp().await {
-                    let local_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-                    let offset = CountdownSniper::calculate_offset_from_block_time(block_ts, local_ms);
-                    countdown.set_clock_offset_ms(offset);
-                    state.add_log(format!("⏱️ Calibrated clock against block (ts: {block_ts}, offset: {offset}ms)"));
-                }
-                let offset_ms = countdown.clock_offset_ms();
+                let countdown = CountdownSniper::new(target_unix, 50);
                 let tx_c = trigger_tx.clone();
                 tokio::spawn(async move { countdown.wait_for_target(tx_c).await; });
-                state.add_log(format!("⏱️ Armed Countdown Sniper for Unix {target_unix} (offset: {offset_ms}ms)"));
+                state.add_log(format!("⏱️ Armed Countdown Sniper for Unix {target_unix} (lead: 50ms)"));
             } else {
                 state.add_log("⚠️ Countdown mode selected but target timestamp is 0 or missing.".to_string());
             }
@@ -278,21 +255,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 4. Advisory Pre-Flight Simulation (Ensures contract & calldata are valid at boot without deadlocking triggers)
     let sim_dest = config.drop.get_dispatch_destination(&target_contract);
     let sim_calldata = config.drop.build_dispatch_calldata(Some(&workers[0].address), config.drop.mint_quantity);
-    match (sim_calldata, config.drop.mint_value_wei.parse::<u128>()) {
-        (Ok(sim_calldata), Ok(sim_val)) => {
-            let simulator = RpcSimulator::new(&endpoints[0].url);
-            match simulator.simulate_call(&workers[0].address, sim_dest, &sim_calldata, sim_val, config.gas.gas_limit).await {
-                Ok(sim_res) if !sim_res.success => {
-                    state.add_log(format!("⚠️ Advisory pre-flight simulation reverted (expected if drop unopen): {:?}", sim_res.revert_reason));
-                }
-                Ok(sim_res) => {
-                    state.add_log(format!("✅ Pre-flight simulation passed ({} gas)", sim_res.gas_used));
-                }
-                Err(e) => state.add_log(format!("⚠️ Pre-flight simulation could not run: {e}")),
-            }
+    if let (Ok(calldata), Ok(sim_val)) = (sim_calldata, config.drop.mint_value_wei.parse::<u128>()) {
+        let simulator = RpcSimulator::new(&endpoints[0].url);
+        match simulator.simulate_call(&workers[0].address, sim_dest, &calldata, sim_val, config.gas.gas_limit).await {
+            Ok(sim_res) if !sim_res.success => state.add_log(format!("⚠️ Advisory simulation reverted: {:?}", sim_res.revert_reason)),
+            Ok(sim_res) => state.add_log(format!("✅ Pre-flight simulation passed ({} gas)", sim_res.gas_used)),
+            Err(e) => state.add_log(format!("⚠️ Pre-flight simulation error: {e}")),
         }
-        (Err(e), _) => state.add_log(format!("❌ Invalid calldata configuration: {e}")),
-        (_, Err(e)) => state.add_log(format!("❌ Invalid mint value in wei: {e}")),
     }
 
     // Pre-Sign Transactions ahead of drop for instantaneous, zero-latency burst dispatch
@@ -339,7 +308,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Main Event Loop
     while state.is_running {
-        terminal.draw(|f| draw_ui(f, &state))?;
+        if let Some(t) = terminal.as_mut() {
+            t.draw(|f| draw_ui(f, &state))?;
+        }
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -359,6 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 state.latency_ms = min_lat;
             }
             Some(log_msg) = ui_log_rx.recv() => {
+                if headless { println!("{log_msg}"); }
                 state.add_log(log_msg);
             }
             Some(event) = events.next() => {
@@ -393,6 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     continue;
                 }
                 has_fired = true;
+                if headless { println!("{msg}"); }
                 state.add_log(msg.clone());
 
                 let alerts_c = alerts.clone();
@@ -405,6 +378,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     state.add_log("⛔ Snipe aborted: current gas fee exceeds ceiling or no transactions prepared.".to_string());
                     has_fired = false;
                     continue;
+                }
+
+                // Atomic MEV Bundles (DEF-03): When multiple wallets on L1, dispatch batch as bundle
+                let is_bundle = is_l1 && mev_client.is_some() && prepared_snipes.len() > 1;
+                if is_bundle {
+                    let mev = mev_client.as_ref().unwrap().clone();
+                    let raw_txs: Vec<String> = prepared_snipes.iter().map(|p| p.raw_tx.clone()).collect();
+                    let racer_target = rpc_racer_clone.clone();
+                    let alerts_c = alerts.clone();
+                    tokio::spawn(async move {
+                        let target_block = racer_target.fetch_latest_block_number().await.unwrap_or(0) + 1;
+                        let outcomes = mev.send_bundle(&raw_txs, target_block).await;
+                        let success = outcomes.iter().any(|o| o.success);
+                        alerts_c.dispatch_alert(
+                            if success { "📦 MEV Bundle Included" } else { "⚠️ MEV Bundle Rejected" },
+                            &format!("Block: {target_block}\nOutcomes: {outcomes:?}"),
+                            success,
+                        ).await;
+                    });
                 }
 
                 // ZERO-LATENCY DISPATCH: blast pre-signed transactions immediately!
@@ -433,25 +425,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     });
 
                     // MEV Private Relay on L1 (Never leak to public mempool at T+0; fallback only if rejected)
-                    if let Some(mev) = &mev_client {
-                        let mev_clone = mev.clone();
-                        let tx_clone = prepared.raw_tx.clone();
-                        let alerts_c = alerts.clone();
-                        let racer_fallback = rpc_racer_clone.clone();
-                        tokio::spawn(async move {
-                            let outcomes = mev_clone.send_private_transaction(&tx_clone).await;
-                            if !outcomes.iter().any(|o| o.success) {
-                                alerts_c.dispatch_alert("⚠️ All Builders Rejected, falling back to public RPC", &format!("{:?}", outcomes), false).await;
-                                let _ = racer_fallback.race_broadcast_raw_tx(&tx_clone).await;
-                            }
-                        });
-                    } else {
-                        // On L2 or without builders: race public RPC endpoints
-                        let racer = rpc_racer_clone.clone();
-                        let raw_tx_clone = prepared.raw_tx.clone();
-                        tokio::spawn(async move {
-                            let _outcomes = racer.race_broadcast_raw_tx(&raw_tx_clone).await;
-                        });
+                    if !is_bundle {
+                        if let Some(mev) = &mev_client {
+                            let mev_clone = mev.clone();
+                            let tx_clone = prepared.raw_tx.clone();
+                            let alerts_c = alerts.clone();
+                            let racer_fallback = rpc_racer_clone.clone();
+                            let allow_fallback = config.gas.allow_public_fallback;
+                            tokio::spawn(async move {
+                                let outcomes = mev_clone.send_private_transaction(&tx_clone).await;
+                                if !outcomes.iter().any(|o| o.success) {
+                                    if allow_fallback {
+                                        alerts_c.dispatch_alert("⚠️ All Builders Rejected, falling back to public RPC", &format!("{outcomes:?}"), false).await;
+                                        let _ = racer_fallback.race_broadcast_raw_tx(&tx_clone).await;
+                                    } else {
+                                        alerts_c.dispatch_alert("⚠️ All Builders Rejected (public fallback disabled to prevent sandwiching)", &format!("{outcomes:?}"), false).await;
+                                    }
+                                }
+                            });
+                        } else {
+                            // On L2 or without builders: race public RPC endpoints
+                            let racer = rpc_racer_clone.clone();
+                            let raw_tx_clone = prepared.raw_tx.clone();
+                            tokio::spawn(async move {
+                                let _outcomes = racer.race_broadcast_raw_tx(&raw_tx_clone).await;
+                            });
+                        }
                     }
 
                     // Background monitor for receipt & auto-speedup (routes replacement to correct destination)
@@ -467,6 +466,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         config.gas.auto_speedup,
                         config.gas.speedup_threshold_ms,
                         config.gas.gas_limit,
+                        config.gas.allow_public_fallback,
                         ui_log_tx.clone(),
                     );
                 }
@@ -475,8 +475,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Restore Terminal
-    disable_raw_mode()?;
-    io::stdout().execute(LeaveAlternateScreen)?;
+    if !headless {
+        disable_raw_mode()?;
+        io::stdout().execute(LeaveAlternateScreen)?;
+    }
     println!("Bot shutdown gracefully.");
 
     Ok(())

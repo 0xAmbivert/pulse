@@ -54,6 +54,16 @@ pub struct DropConfig {
     pub trigger_mode: TriggerMode,
     #[serde(default)]
     pub merkle_proof: Vec<String>,
+    #[serde(default)]
+    pub allowlist_end_time: Option<u64>,
+    #[serde(default)]
+    pub allowlist_stage_index: Option<u64>,
+    #[serde(default)]
+    pub allowlist_max_supply: Option<u64>,
+    #[serde(default)]
+    pub allowlist_fee_bps: Option<u16>,
+    #[serde(default)]
+    pub allowlist_wallet_limit: Option<u64>,
     pub custom_calldata_hex: Option<String>,
     pub target_timestamp: Option<u64>,
     pub target_block: Option<u64>,
@@ -74,6 +84,11 @@ impl Default for DropConfig {
             mint_quantity: 1,
             trigger_mode: TriggerMode::StatePoller,
             merkle_proof: Vec::new(),
+            allowlist_end_time: None,
+            allowlist_stage_index: None,
+            allowlist_max_supply: None,
+            allowlist_fee_bps: None,
+            allowlist_wallet_limit: None,
             custom_calldata_hex: None,
             target_timestamp: None,
             target_block: None,
@@ -157,28 +172,20 @@ impl DropConfig {
         if func_sig.contains("bytes32[]") {
             let proof_bytes = encode_bytes32_slice(&self.merkle_proof)?;
             if func_sig.contains("address") && func_sig.contains("uint256") {
-                let addr_bytes = encode_address_word(caller)?;
-                data.extend_from_slice(&addr_bytes);
+                data.extend_from_slice(&encode_address_word(caller)?);
                 data.extend_from_slice(&u256_word(quantity));
-                data.extend_from_slice(&u256_word(96)); // offset 0x60
-                data.extend_from_slice(&proof_bytes);
-                return Ok(data);
+                data.extend_from_slice(&u256_word(96));
             } else if func_sig.contains("uint256") {
                 data.extend_from_slice(&u256_word(quantity));
-                data.extend_from_slice(&u256_word(64)); // offset 0x40
-                data.extend_from_slice(&proof_bytes);
-                return Ok(data);
+                data.extend_from_slice(&u256_word(64));
             } else if func_sig.contains("address") {
-                let addr_bytes = encode_address_word(caller)?;
-                data.extend_from_slice(&addr_bytes);
-                data.extend_from_slice(&u256_word(64)); // offset 0x40
-                data.extend_from_slice(&proof_bytes);
-                return Ok(data);
+                data.extend_from_slice(&encode_address_word(caller)?);
+                data.extend_from_slice(&u256_word(64));
             } else {
-                data.extend_from_slice(&u256_word(32)); // offset 0x20
-                data.extend_from_slice(&proof_bytes);
-                return Ok(data);
+                data.extend_from_slice(&u256_word(32));
             }
+            data.extend_from_slice(&proof_bytes);
+            return Ok(data);
         }
 
         // Recipient mints: mint(address,uint256)
@@ -238,7 +245,17 @@ impl DropConfig {
 
     /// Builds exact SeaDrop mintAllowList calldata:
     /// mintAllowList(address,address,address,(uint256,uint256,uint256,uint256,uint256,uint256,uint16,bool),bytes32[])
-    pub fn build_seadrop_allowlist_calldata(&self, minter: Option<&str>, quantity: u64) -> Result<Vec<u8>, String> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_seadrop_allowlist_calldata(
+        &self,
+        minter: Option<&str>,
+        quantity: u64,
+        end_time: u64,
+        drop_stage_index: u64,
+        max_supply: u64,
+        fee_bps: u16,
+        wallet_limit: u64,
+    ) -> Result<Vec<u8>, String> {
         let (w1, w2, w3) = self.seadrop_addrs(minter)?;
         let mint_price = self.mint_value_wei.trim().parse::<u128>().unwrap_or(0);
 
@@ -252,10 +269,18 @@ impl DropConfig {
         let mut price_word = [0u8; 32];
         price_word[16..32].copy_from_slice(&mint_price.to_be_bytes());
         data.extend_from_slice(&price_word);
-        data.extend_from_slice(&u256_word(quantity));
+        let limit = if wallet_limit > 0 { wallet_limit } else { quantity };
+        data.extend_from_slice(&u256_word(limit));
         data.extend_from_slice(&u256_word(self.target_timestamp.unwrap_or(0)));
-        data.extend_from_slice(&[0u8; 32 * 5]); // endTime, stageIndex, maxSupply, feeBps, restrictFeeRecipients
-        data.extend_from_slice(&u256_word(384)); // offset to bytes32[]: 12 words * 32 = 384 (0x0180)
+        let final_end = if end_time > 0 { end_time } else { u64::MAX };
+        data.extend_from_slice(&u256_word(final_end));
+        data.extend_from_slice(&u256_word(drop_stage_index));
+        data.extend_from_slice(&u256_word(max_supply));
+        data.extend_from_slice(&u256_word(fee_bps as u64));
+        data.extend_from_slice(&u256_word(0)); // restrictFeeRecipients (bool)
+
+        // Offset pointer to bytes32[]: 12 words * 32 bytes = 384 (0x0180)
+        data.extend_from_slice(&u256_word(384));
         data.extend_from_slice(&encode_bytes32_slice(&self.merkle_proof)?);
         Ok(data)
     }
@@ -264,7 +289,15 @@ impl DropConfig {
     pub fn build_dispatch_calldata(&self, caller: Option<&str>, quantity: u64) -> Result<Vec<u8>, String> {
         if self.seadrop_contract.is_some() {
             if !self.merkle_proof.is_empty() {
-                self.build_seadrop_allowlist_calldata(caller, quantity)
+                self.build_seadrop_allowlist_calldata(
+                    caller,
+                    quantity,
+                    self.allowlist_end_time.unwrap_or(u64::MAX),
+                    self.allowlist_stage_index.unwrap_or(0),
+                    self.allowlist_max_supply.unwrap_or(0),
+                    self.allowlist_fee_bps.unwrap_or(0),
+                    self.allowlist_wallet_limit.unwrap_or(quantity),
+                )
             } else {
                 self.build_seadrop_calldata(caller, quantity)
             }
@@ -292,6 +325,8 @@ pub struct GasConfig {
     pub speedup_threshold_ms: u64,
     pub speedup_bump_percent: u32, // default: 15%
     pub hard_gas_ceiling_gwei: f64,
+    #[serde(default)]
+    pub allow_public_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,15 +342,9 @@ impl Default for AppConfig {
             chain: ChainConfig {
                 chain_id: 1,
                 name: "Ethereum Mainnet".to_string(),
-                rpc_urls: vec![
-                    "https://eth.llamarpc.com".to_string(),
-                    "https://rpc.payload.de".to_string(),
-                ],
+                rpc_urls: vec!["https://eth.llamarpc.com".to_string(), "https://rpc.payload.de".to_string()],
                 ws_rpc_url: None,
-                mev_builder_urls: vec![
-                    "https://relay.flashbots.net".to_string(),
-                    "https://rpc.titanbuilder.xyz".to_string(),
-                ],
+                mev_builder_urls: vec!["https://relay.flashbots.net".to_string(), "https://rpc.titanbuilder.xyz".to_string()],
                 rpc_timeout_ms: 2000,
             },
             drop: DropConfig::default(),
@@ -327,12 +356,9 @@ impl Default for AppConfig {
                 speedup_threshold_ms: 12_000,
                 speedup_bump_percent: 15,
                 hard_gas_ceiling_gwei: 150.0,
+                allow_public_fallback: false,
             },
-            alerts: AlertConfig {
-                discord_webhook: None,
-                telegram_bot_token: None,
-                telegram_chat_id: None,
-            },
+            alerts: AlertConfig { discord_webhook: None, telegram_bot_token: None, telegram_chat_id: None },
         }
     }
 }
@@ -340,41 +366,20 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn load_from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let content = fs::read_to_string(path)?;
-        let config: AppConfig = toml::from_str(&content)?;
-        Ok(config)
+        Ok(toml::from_str(&content)?)
     }
 
     pub fn save_to_file(&self, path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let content = toml::to_string_pretty(self)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        
+        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)?;
-
-            // Explicitly set permissions on existing files just in case
-            if let Ok(metadata) = file.metadata() {
-                let mut perms = metadata.permissions();
-                perms.set_mode(0o600);
-                let _ = file.set_permissions(perms);
-            }
-
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
             std::io::Write::write_all(&mut file, content.as_bytes())?;
         }
-        
         #[cfg(not(unix))]
-        {
-            fs::write(path, content)?;
-        }
-
+        { fs::write(path, content)?; }
         Ok(())
     }
 }
@@ -385,37 +390,24 @@ mod tests {
 
     #[test]
     fn test_calldata_builder_parameterless() {
-        let drop = DropConfig {
-            mint_function: "mint()".to_string(),
-            ..Default::default()
-        };
-        let calldata = drop.build_calldata().unwrap();
-        assert_eq!(calldata.len(), 4);
+        let drop = DropConfig { mint_function: "mint()".to_string(), ..Default::default() };
+        assert_eq!(drop.build_calldata().unwrap().len(), 4);
     }
 
     #[test]
     fn test_calldata_builder_uint256() {
-        let drop = DropConfig {
-            mint_function: "mint(uint256)".to_string(),
-            ..Default::default()
-        };
-        let calldata = drop.build_calldata().unwrap();
-        assert_eq!(calldata.len(), 36);
-        assert_eq!(calldata[35], 1);
-        let calldata = drop.build_calldata_for_caller(None, 3).unwrap();
-        assert_eq!(calldata[35], 3);
+        let drop = DropConfig { mint_function: "mint(uint256)".to_string(), ..Default::default() };
+        assert_eq!(drop.build_calldata().unwrap().len(), 36);
+        assert_eq!(drop.build_calldata_for_caller(None, 3).unwrap()[35], 3);
     }
 
     #[test]
     fn test_calldata_builder_address_uint256() {
-        let drop = DropConfig {
-            mint_function: "mint(address,uint256)".to_string(),
-            ..Default::default()
-        };
+        let drop = DropConfig { mint_function: "mint(address,uint256)".to_string(), ..Default::default() };
         let caller = "0x1111111111111111111111111111111111111111";
         let calldata = drop.build_calldata_for_caller(Some(caller), 1).unwrap();
         assert_eq!(calldata.len(), 4 + 32 + 32);
-        assert_eq!(calldata[67], 1); // quantity 1 at end of second 32-byte word
+        assert_eq!(calldata[67], 1);
     }
 
     #[test]
@@ -463,15 +455,29 @@ mod tests {
             seadrop_contract: Some(crate::eligibility::seadrop::SEADROP_V1_ADDRESS.to_string()),
             mint_value_wei: "50000000000000000".to_string(),
             merkle_proof: vec![proof_elem],
+            allowlist_end_time: Some(1_800_000_000),
+            allowlist_stage_index: Some(1),
+            allowlist_max_supply: Some(500),
+            allowlist_fee_bps: Some(250),
+            allowlist_wallet_limit: Some(5),
             ..Default::default()
         };
         let caller = "0x1111111111111111111111111111111111111111";
         let calldata = drop.build_dispatch_calldata(Some(caller), 2).unwrap();
         assert_eq!(&calldata[0..4], &[0x7b, 0x23, 0x3a, 0x75]);
-        // 4 + 32 * (12 head words + 1 len word + 1 proof word) = 4 + 32 * 14 = 452
         assert_eq!(calldata.len(), 4 + 32 * 14);
+
+        // Word 4 (idx 4 + 4*32): maxTotalMintableByWallet = 5
+        assert_eq!(calldata[4 + 4 * 32 + 31], 5);
+        // Word 6 (idx 4 + 6*32): endTime = 1_800_000_000
+        let end_idx = 4 + 6 * 32;
+        assert_eq!(u64::from_be_bytes(calldata[end_idx + 24..end_idx + 32].try_into().unwrap()), 1_800_000_000);
+        // Word 7 (idx 4 + 7*32): dropStageIndex = 1
+        assert_eq!(calldata[4 + 7 * 32 + 31], 1);
+        // Word 9 (idx 4 + 9*32): feeBps = 250
+        assert_eq!(calldata[4 + 9 * 32 + 31], 250);
         // Word 11 is offset to bytes32[]: 384 (0x0180)
-        let offset_idx = 4 + 11 * 32 + 30; // 384 is 0x0180, so byte 30 is 1, byte 31 is 0x80
+        let offset_idx = 4 + 11 * 32 + 30;
         assert_eq!(calldata[offset_idx], 1);
         assert_eq!(calldata[offset_idx + 1], 0x80);
     }

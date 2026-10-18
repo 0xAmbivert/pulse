@@ -37,31 +37,30 @@ impl CountdownSniper {
         self.clock_offset_ms
     }
 
-    /// Calculates clock offset from latest on-chain block timestamp against local system time.
-    /// Returns offset in milliseconds: positive if local clock is behind block time, negative if ahead.
-    pub fn calculate_offset_from_block_time(block_timestamp_secs: u64, local_time_ms: i64) -> i64 {
-        (block_timestamp_secs as i64 * 1000) - local_time_ms
-    }
-
-    /// Runs countdown loop until target timestamp (minus lead_time_ms), then triggers the dispatch channel.
+    /// Runs countdown loop until target timestamp (minus lead_time_ms and offset),
+    /// then triggers the dispatch channel.
     pub async fn wait_for_target(&self, tx: mpsc::Sender<SnipeTrigger>) {
+        let target_ms = self.target_timestamp.saturating_mul(1000);
+        let effective_lead = self.lead_time_ms as i64 + self.clock_offset_ms;
+        let fire_ms = if effective_lead >= 0 {
+            target_ms.saturating_sub(effective_lead as u64)
+        } else {
+            target_ms.saturating_add((-effective_lead) as u64)
+        };
+
         loop {
             let raw_now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO)
-                .as_millis() as i64;
-            let now = (raw_now + self.clock_offset_ms).max(0) as u64;
+                .as_millis() as u64;
 
-            let target_ms = self.target_timestamp.saturating_mul(1000);
-            let fire_ms = target_ms.saturating_sub(self.lead_time_ms);
-
-            if now >= fire_ms {
+            if raw_now >= fire_ms {
                 info!("Countdown reached target {}! Lead time {}ms. Triggering burst!", self.target_timestamp, self.lead_time_ms);
                 let _ = tx.send(SnipeTrigger::CountdownReached { target_unix: self.target_timestamp }).await;
                 break;
             }
 
-            let diff_ms = fire_ms - now;
+            let diff_ms = fire_ms - raw_now;
             if diff_ms > 1000 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             } else if diff_ms > 50 {
@@ -88,15 +87,14 @@ mod tests {
         assert!(matches!(received, SnipeTrigger::CountdownReached { target_unix } if target_unix == past_timestamp));
     }
 
-    #[test]
-    fn test_clock_offset_calculation() {
-        let block_ts = 1_700_000_000u64;
-        let local_ms = 1_699_999_998_000i64; // local clock is 2 seconds behind
-        let offset = CountdownSniper::calculate_offset_from_block_time(block_ts, local_ms);
-        assert_eq!(offset, 2000);
-
-        let mut sniper = CountdownSniper::new(block_ts, 50);
-        sniper.set_clock_offset_ms(offset);
-        assert_eq!(sniper.clock_offset_ms(), 2000);
+    #[tokio::test]
+    async fn test_countdown_sniper_with_offset() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let now_sec = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let target_ts = now_sec + 1;
+        let sniper = CountdownSniper::with_offset(target_ts, 2000, 0);
+        sniper.wait_for_target(tx).await;
+        let received = rx.recv().await.unwrap();
+        assert!(matches!(received, SnipeTrigger::CountdownReached { target_unix } if target_unix == target_ts));
     }
 }

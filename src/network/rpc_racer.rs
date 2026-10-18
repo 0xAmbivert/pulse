@@ -237,112 +237,94 @@ impl RpcRacer {
         self.poll_receipts(&[tx_hash.to_string()]).await
     }
 
-    /// Queries the latest block's baseFeePerGas from healthy endpoints.
+    /// Races an arbitrary JSON-RPC query across all healthy endpoints in parallel,
+    /// returning the first valid parsed result and aborting remaining in-flight requests.
+    async fn race_query<T: Send + 'static>(
+        &self,
+        payload: Value,
+        parser: fn(&Value) -> Option<T>,
+    ) -> Option<T> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let mut handles = Vec::new();
+        let mut tasks = FuturesUnordered::new();
+
+        for ep in &self.endpoints {
+            if !ep.is_healthy {
+                continue;
+            }
+            let client = self.client.clone();
+            let url = ep.url.clone();
+            let p = payload.clone();
+            let handle = tokio::spawn(async move {
+                if let Ok(resp) = client.post(&url).json(&p).send().await {
+                    if let Ok(json_body) = resp.json::<Value>().await {
+                        if let Some(res) = json_body.get("result") {
+                            return parser(res);
+                        }
+                    }
+                }
+                None
+            });
+            handles.push(handle.abort_handle());
+            tasks.push(handle);
+        }
+
+        let mut found = None;
+        while let Some(res) = tasks.next().await {
+            if let Ok(Some(val)) = res {
+                found = Some(val);
+                break;
+            }
+        }
+        for h in handles {
+            h.abort();
+        }
+        found
+    }
+
+    /// Queries the latest block's baseFeePerGas across endpoints in parallel.
     pub async fn fetch_latest_base_fee(&self) -> Option<u128> {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "method": "eth_getBlockByNumber",
-            "params": ["latest", false],
-            "id": 1
-        });
-
-        for ep in &self.endpoints {
-            if !ep.is_healthy {
-                continue;
-            }
-            if let Ok(resp) = self.client.post(&ep.url).json(&payload).send().await {
-                if let Ok(json_body) = resp.json::<Value>().await {
-                    if let Some(base_fee_hex) = json_body.get("result")
-                        .and_then(|r| r.get("baseFeePerGas"))
-                        .and_then(|b| b.as_str()) {
-                        if let Ok(base_fee) = u128::from_str_radix(base_fee_hex.trim_start_matches("0x"), 16) {
-                            return Some(base_fee);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        let payload = json!({"jsonrpc": "2.0", "method": "eth_getBlockByNumber", "params": ["latest", false], "id": 1});
+        self.race_query(payload, |r| {
+            let hex_str = r.get("baseFeePerGas")?.as_str()?;
+            u128::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok()
+        }).await
     }
 
-    /// Queries the latest block's timestamp from healthy endpoints.
+    /// Queries the latest block's timestamp across endpoints in parallel.
     pub async fn fetch_latest_block_timestamp(&self) -> Option<u64> {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "method": "eth_getBlockByNumber",
-            "params": ["latest", false],
-            "id": 1
-        });
-
-        for ep in &self.endpoints {
-            if !ep.is_healthy {
-                continue;
-            }
-            if let Ok(resp) = self.client.post(&ep.url).json(&payload).send().await {
-                if let Ok(json_body) = resp.json::<Value>().await {
-                    if let Some(ts_hex) = json_body.get("result")
-                        .and_then(|r| r.get("timestamp"))
-                        .and_then(|t| t.as_str()) {
-                        if let Ok(ts) = u64::from_str_radix(ts_hex.trim_start_matches("0x"), 16) {
-                            return Some(ts);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        let payload = json!({"jsonrpc": "2.0", "method": "eth_getBlockByNumber", "params": ["latest", false], "id": 1});
+        self.race_query(payload, |r| {
+            let hex_str = r.get("timestamp")?.as_str()?;
+            u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok()
+        }).await
     }
 
-    /// Queries the on-chain confirmed transaction count (nonce) for an address.
+    /// Queries the latest confirmed block number across endpoints in parallel.
+    pub async fn fetch_latest_block_number(&self) -> Option<u64> {
+        let payload = json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1});
+        self.race_query(payload, |r| {
+            let hex_str = r.as_str()?;
+            u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok()
+        }).await
+    }
+
+    /// Queries the on-chain confirmed transaction count (nonce) for an address in parallel.
     pub async fn fetch_transaction_count(&self, address: &str) -> Option<u64> {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "method": "eth_getTransactionCount",
-            "params": [address, "latest"],
-            "id": 1
-        });
-
-        for ep in &self.endpoints {
-            if !ep.is_healthy {
-                continue;
-            }
-            if let Ok(resp) = self.client.post(&ep.url).json(&payload).send().await {
-                if let Ok(json_body) = resp.json::<Value>().await {
-                    if let Some(count_hex) = json_body.get("result").and_then(|r| r.as_str()) {
-                        if let Ok(count) = u64::from_str_radix(count_hex.trim_start_matches("0x"), 16) {
-                            return Some(count);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        let payload = json!({"jsonrpc": "2.0", "method": "eth_getTransactionCount", "params": [address, "latest"], "id": 1});
+        self.race_query(payload, |r| {
+            let hex_str = r.as_str()?;
+            u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok()
+        }).await
     }
 
-    /// Queries the on-chain balance in Wei for an address using eth_getBalance.
+    /// Queries the on-chain balance in Wei for an address across endpoints in parallel.
     pub async fn fetch_balance(&self, address: &str) -> Option<u128> {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "method": "eth_getBalance",
-            "params": [address, "latest"],
-            "id": 1
-        });
-
-        for ep in &self.endpoints {
-            if !ep.is_healthy {
-                continue;
-            }
-            if let Ok(resp) = self.client.post(&ep.url).json(&payload).send().await {
-                if let Ok(json_body) = resp.json::<Value>().await {
-                    if let Some(bal_hex) = json_body.get("result").and_then(|r| r.as_str()) {
-                        if let Ok(bal) = u128::from_str_radix(bal_hex.trim_start_matches("0x"), 16) {
-                            return Some(bal);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        let payload = json!({"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1});
+        self.race_query(payload, |r| {
+            let hex_str = r.as_str()?;
+            u128::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok()
+        }).await
     }
 
     pub fn endpoints(&self) -> &[RpcEndpoint] {

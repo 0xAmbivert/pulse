@@ -22,9 +22,15 @@ impl AlertDispatcher {
             .unwrap_or_else(|_| Client::new());
 
         // Allow fallback to environment variables so webhook secrets need not be written to disk config
-        let discord_webhook = discord_webhook.or_else(|| std::env::var("DISCORD_WEBHOOK").ok());
-        let telegram_token = telegram_token.or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok());
-        let telegram_chat_id = telegram_chat_id.or_else(|| std::env::var("TELEGRAM_CHAT_ID").ok());
+        let discord_webhook = discord_webhook
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("DISCORD_WEBHOOK").ok().filter(|s| !s.trim().is_empty()));
+        let telegram_token = telegram_token
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok().filter(|s| !s.trim().is_empty()));
+        let telegram_chat_id = telegram_chat_id
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("TELEGRAM_CHAT_ID").ok().filter(|s| !s.trim().is_empty()));
 
         Self {
             client,
@@ -66,5 +72,18 @@ impl AlertDispatcher {
                 warn!("Failed to dispatch Telegram alert: {}", e.without_url());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_string_env_fallback() {
+        std::env::set_var("DISCORD_WEBHOOK", "https://discord.com/api/webhooks/test");
+        let dispatcher = AlertDispatcher::new(Some("".to_string()), None, None);
+        assert_eq!(dispatcher.discord_webhook.as_deref(), Some("https://discord.com/api/webhooks/test"));
+        std::env::remove_var("DISCORD_WEBHOOK");
     }
 }

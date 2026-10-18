@@ -33,6 +33,7 @@ pub fn spawn_tx_monitor(
     auto_speedup: bool,
     speedup_threshold_ms: u64,
     gas_limit: u64,
+    allow_public_fallback: bool,
     ui_log_tx: mpsc::Sender<String>,
 ) {
     tokio::spawn(async move {
@@ -178,17 +179,14 @@ pub fn spawn_tx_monitor(
                                     let alerts_c = alerts.clone();
                                     let racer_fallback = rpc_racer.clone();
                                     tokio::spawn(async move {
-                                        let outcomes =
-                                            mev_c.send_private_transaction(&raw_c).await;
+                                        let outcomes = mev_c.send_private_transaction(&raw_c).await;
                                         if !outcomes.iter().any(|o| o.success) {
-                                            alerts_c
-                                                .dispatch_alert(
-                                                    "⚠️ All Builders Rejected Speedup, falling back to public RPC",
-                                                    &format!("{:?}", outcomes),
-                                                    false,
-                                                )
-                                                .await;
-                                            let _ = racer_fallback.race_broadcast_raw_tx(&raw_c).await;
+                                            if allow_public_fallback {
+                                                alerts_c.dispatch_alert("⚠️ All Builders Rejected Speedup, falling back to public RPC", &format!("{:?}", outcomes), false).await;
+                                                let _ = racer_fallback.race_broadcast_raw_tx(&raw_c).await;
+                                            } else {
+                                                alerts_c.dispatch_alert("⚠️ All Builders Rejected Speedup (public fallback disabled to prevent sandwiching)", &format!("{:?}", outcomes), false).await;
+                                            }
                                         }
                                     });
                                 } else {
