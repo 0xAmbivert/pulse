@@ -47,6 +47,17 @@ pub struct WalletEligibilityStatus {
     pub simulated_gas_used: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenSeaEligibilityResult {
+    pub is_eligible: bool,
+    pub max_mintable: Option<u64>,
+    pub price_wei: Option<u128>,
+    #[serde(default)]
+    pub merkle_proof: Vec<String>,
+    pub stage_name: Option<String>,
+    pub signature: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComprehensiveDropReport {
     pub target: ResolvedDropTarget,
@@ -57,4 +68,6 @@ pub struct ComprehensiveDropReport {
     pub stages: Vec<MintStageInfo>,
     pub seadrop_config: Option<SeaDropPublicConfig>,
     pub wallet_status: WalletEligibilityStatus,
+    #[serde(default)]
+    pub opensea_eligibility: Option<OpenSeaEligibilityResult>,
 }

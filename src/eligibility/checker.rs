@@ -91,7 +91,13 @@ impl EligibilityChecker {
 
         // 4. Calculate Wallet Eligibility
         // Unknown per-wallet state is not treated as zero minted; see `wallet_state_known`.
-        let wallet_state_known = onchain_stats.is_some() || seadrop_public.is_some();
+        let opensea_eligibility = if let Some(ref slug) = target.collection_slug {
+            self.opensea.fetch_drop_eligibility(slug, wallet_address).await.ok()
+        } else {
+            None
+        };
+
+        let wallet_state_known = onchain_stats.is_some() || seadrop_public.is_some() || opensea_eligibility.is_some();
         let minted_by_wallet = onchain_stats.map(|(w, _, _)| w).unwrap_or(0);
         let max_per_wallet = seadrop_public
             .as_ref()
@@ -208,6 +214,7 @@ impl EligibilityChecker {
                 status_reason,
                 simulated_gas_used: simulated_gas,
             },
+            opensea_eligibility,
         })
     }
 
@@ -259,6 +266,11 @@ impl EligibilityChecker {
         if report.wallet_status.is_eligible {
             let gas_info = report.wallet_status.simulated_gas_used.map_or(String::new(), |g| format!(" (Simulated Gas: {g})"));
             out.push_str(&format!("     ✅ ELIGIBLE TO MINT! (Can mint up to {} tokens){gas_info}\n", rem_str));
+            if let Some(ref oe) = report.opensea_eligibility {
+                if !oe.merkle_proof.is_empty() {
+                    out.push_str(&format!("     📜 OpenSea Allowlist Merkle Proof: {} hash(es) available\n", oe.merkle_proof.len()));
+                }
+            }
         } else {
             out.push_str(&format!("     ⛔ NOT ELIGIBLE: {}\n", report.wallet_status.status_reason));
         }

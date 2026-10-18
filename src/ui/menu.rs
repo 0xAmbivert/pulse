@@ -40,6 +40,15 @@ fn read_private_key(prompt: &str) -> Result<Option<String>, Box<dyn std::error::
     Ok(Some(line.trim().to_string()))
 }
 
+fn parse_hex_hashes(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(|s| s.trim().trim_start_matches("0x").to_string())
+        .filter(|s| s.len() == 64 && hex::decode(s).is_ok())
+        .map(|s| format!("0x{s}"))
+        .collect()
+}
+
 /// Displays the interactive CLI menu and returns the ephemeral session configuration.
 pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction, Box<dyn std::error::Error + Send + Sync>> {
     loop {
@@ -118,22 +127,35 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 }
 
                 // If user entered an OpenSea URL, resolve it automatically!
+                let mut auto_merkle_proof = Vec::new();
                 let (target_addr, mut detected_mint_func, mut detected_price_wei) = if let Some(slug) = OpenSeaClient::extract_slug(&target_input) {
-                    println!("🔎 Resolving OpenSea collection slug: '{}'...", slug);
-                    let opensea = OpenSeaClient::new();
+                    println!("🔎 Resolving OpenSea collection slug: '{slug}'...");
+                    let mut opensea = OpenSeaClient::new();
                     match opensea.fetch_collection_by_slug(&slug).await {
                         Ok(resolved) => {
                             println!("✅ Resolved OpenSea drop: '{}' -> {}", resolved.collection_name, resolved.contract_address);
+                            println!("🔑 Self-authenticating with OpenSea via SIWE (EIP-4361)...");
+                            if opensea.authenticate_with_key(&keys[0], base_config.chain.chain_id).await.is_ok() {
+                                println!("✅ OpenSea SIWE session authenticated.");
+                                if let Ok(addr) = crate::crypto::get_address_from_protected(&keys[0]) {
+                                    if let Ok(elig) = opensea.fetch_drop_eligibility(&slug, &addr).await {
+                                        if !elig.merkle_proof.is_empty() {
+                                            println!("📜 Auto-loaded {} allowlist Merkle proof hash(es) from OpenSea!", elig.merkle_proof.len());
+                                            auto_merkle_proof = elig.merkle_proof;
+                                        }
+                                    }
+                                }
+                            }
                             (resolved.contract_address, None, None)
                         }
                         Err(e) => {
-                            println!("❌ Failed to resolve OpenSea slug ({}). Please enter the 42-character 0x contract address directly.", e);
+                            println!("❌ Failed to resolve OpenSea slug ({e}). Please enter 42-char 0x address directly.");
                             continue;
                         }
                     }
                 } else {
                     if !target_input.starts_with("0x") || target_input.len() != 42 {
-                        println!("❌ Invalid contract address: expected 42-character 0x address or valid OpenSea collection link.");
+                        println!("❌ Invalid contract address: expected 42-char 0x address or OpenSea collection link.");
                         continue;
                     }
                     (target_input, None, None)
@@ -183,33 +205,23 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 // 5. Mint Value in Wei (Optional: Enter for default). Invalid input re-prompts.
                 let default_val_wei = detected_price_wei.unwrap_or_else(|| base_config.drop.mint_value_wei.clone());
                 let mint_value_wei = loop {
-                    print!("5️⃣  Enter Mint Value in Wei (Press Enter for '{}'): ", default_val_wei);
+                    print!("5️⃣  Enter Mint Value in Wei (Press Enter for '{default_val_wei}'): ");
                     io::stdout().flush()?;
-                    let Some(val_input) = read_line_opt()? else {
-                        return Ok(MenuAction::Exit);
-                    };
+                    let Some(val_input) = read_line_opt()? else { return Ok(MenuAction::Exit); };
                     let trimmed = val_input.trim();
-                    if trimmed.is_empty() {
-                        break default_val_wei.clone();
-                    }
-                    if trimmed.parse::<u128>().is_ok() {
-                        break trimmed.to_string();
-                    }
+                    if trimmed.is_empty() { break default_val_wei.clone(); }
+                    if trimmed.parse::<u128>().is_ok() { break trimmed.to_string(); }
                     println!("❌ Invalid mint value '{trimmed}'. Enter an integer number of Wei (e.g. 0).");
                 };
 
                 // 6. Mint Quantity (Optional: Enter for default). Invalid input re-prompts.
                 let default_qty = base_config.drop.mint_quantity;
                 let mint_quantity = loop {
-                    print!("6️⃣  Enter Mint Quantity (Press Enter for '{}'): ", default_qty);
+                    print!("6️⃣  Enter Mint Quantity (Press Enter for '{default_qty}'): ");
                     io::stdout().flush()?;
-                    let Some(qty_input) = read_line_opt()? else {
-                        return Ok(MenuAction::Exit);
-                    };
+                    let Some(qty_input) = read_line_opt()? else { return Ok(MenuAction::Exit); };
                     let trimmed = qty_input.trim();
-                    if trimmed.is_empty() {
-                        break default_qty;
-                    }
+                    if trimmed.is_empty() { break default_qty; }
                     match trimmed.parse::<u64>() {
                         Ok(q) if q > 0 => break q,
                         _ => println!("❌ Invalid quantity '{trimmed}'. Enter a positive integer."),
@@ -220,13 +232,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 let max_gas_fee = loop {
                     print!("7️⃣  Enter Max Gas Fee in Gwei (Press Enter for '{:.1}'): ", base_config.gas.max_fee_gwei);
                     io::stdout().flush()?;
-                    let Some(gas_input) = read_line_opt()? else {
-                        return Ok(MenuAction::Exit);
-                    };
+                    let Some(gas_input) = read_line_opt()? else { return Ok(MenuAction::Exit); };
                     let trimmed = gas_input.trim();
-                    if trimmed.is_empty() {
-                        break base_config.gas.max_fee_gwei;
-                    }
+                    if trimmed.is_empty() { break base_config.gas.max_fee_gwei; }
                     match trimmed.parse::<f64>() {
                         Ok(v) if v.is_finite() && v > 0.0 => break v,
                         _ => println!("❌ Invalid gas fee '{trimmed}'. Enter a positive number of Gwei."),
@@ -275,17 +283,16 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                     || mint_function.to_lowercase().contains("whitelist")
                     || mint_function.to_lowercase().contains("allowlist")
                     || seadrop_contract.is_some();
-                let mut merkle_proof = base_config.drop.merkle_proof.clone();
-                if is_allowlist {
+                let mut merkle_proof = if !auto_merkle_proof.is_empty() {
+                    auto_merkle_proof
+                } else {
+                    base_config.drop.merkle_proof.clone()
+                };
+                if is_allowlist && merkle_proof.is_empty() {
                     print!("📜 Enter Merkle Proof hashes (comma-separated hex or press Enter to skip): ");
                     io::stdout().flush()?;
                     if let Some(proof_str) = read_line_opt()? {
-                        let hashes: Vec<String> = proof_str
-                            .split(',')
-                            .map(|s| s.trim().trim_start_matches("0x").to_string())
-                            .filter(|s| s.len() == 64 && hex::decode(s).is_ok())
-                            .map(|s| format!("0x{s}"))
-                            .collect();
+                        let hashes = parse_hex_hashes(&proof_str);
                         if !hashes.is_empty() {
                             println!("✅ Loaded {} valid Merkle proof hash(es).", hashes.len());
                             merkle_proof = hashes;
@@ -420,16 +427,17 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                                         || s.label.to_lowercase().contains("allowlist")
                                         || s.label.to_lowercase().contains("whitelist")
                                 });
-                                if has_allowlist || report.drop_mechanism.contains("SeaDrop") {
+                                if let Some(ref oe) = report.opensea_eligibility {
+                                    if !oe.merkle_proof.is_empty() {
+                                        session_config.drop.merkle_proof = oe.merkle_proof.clone();
+                                        println!("📜 Pre-loaded {} Merkle proof hash(es) from OpenSea report.", oe.merkle_proof.len());
+                                    }
+                                }
+                                if session_config.drop.merkle_proof.is_empty() && (has_allowlist || report.drop_mechanism.contains("SeaDrop")) {
                                     print!("📜 Enter Merkle Proof hashes (comma-separated hex or press Enter to skip): ");
                                     io::stdout().flush()?;
                                     if let Some(proof_str) = read_line_opt()? {
-                                        let hashes: Vec<String> = proof_str
-                                            .split(',')
-                                            .map(|s| s.trim().trim_start_matches("0x").to_string())
-                                            .filter(|s| s.len() == 64 && hex::decode(s).is_ok())
-                                            .map(|s| format!("0x{s}"))
-                                            .collect();
+                                        let hashes = parse_hex_hashes(&proof_str);
                                         if !hashes.is_empty() {
                                             println!("✅ Loaded {} valid Merkle proof hash(es).", hashes.len());
                                             session_config.drop.merkle_proof = hashes;
