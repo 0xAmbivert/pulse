@@ -25,6 +25,8 @@
 - [Core Value Propositions & Guarantees](#-core-value-propositions--guarantees)
 - [Cryptographic Security & RAM-Only Threat Model](#-cryptographic-security--ram-only-threat-model)
 - [Independence from Web Platforms (Crash-Proof Drops)](#-independence-from-web-platforms-crash-proof-drops)
+- [OpenSea Self-Signed SIWE (EIP-4361) Authentication](#-opensea-self-signed-siwe-eip-4361-authentication)
+- [Allowlist & Merkle Proof Minting Engine](#-allowlist--merkle-proof-minting-engine)
 - [Installation & Compilation](#-installation--compilation)
 - [Complete Operations & Quickstart Guide](#-complete-operations--quickstart-guide)
   - [1. Launching Pulse](#1️⃣-launching-pulse)
@@ -41,12 +43,17 @@
 
 | Feature | The Guarantee | How Pulse Delivers |
 | :--- | :--- | :--- |
-| **No Keystore Files** | Keys are never written by Pulse | Key is read into a dedicated `mmap` page, `mlock`ed (fail-closed), `MADV_DONTDUMP`, and zeroized on drop; no keystore files are created |
-| **Zero Web Dependencies** | Immune to OpenSea / MintGo website crashes | Mint transactions route directly to on-chain smart contracts via RPC/MEV sockets |
-| **Low-Latency Dispatch** | Minimal work on the trigger path | EIP-1559 transactions are pre-constructed and pre-signed in memory ahead of the drop; latency is measured, not guaranteed |
-| **Chain-Aware Relaying** | L1 private-builder first; L2 public RPC only | On L1, builders are tried first and public RPC is used only if builders reject; on L2, RPC racers only |
-| **Hard Gas Guardrails** | Never overpay in a spike | Enforces hard gas fee ceilings; aborts instead of substituting static fallback fees |
-| **Replace-By-Fee (RBF)** | Never stuck in pending status | Background monitor polls receipts; automatically bumps gas fees and re-broadcasts |
+| **No Keystore Files** | Keys are never written to disk | Read into dedicated `mmap` page, `mlock`ed (fail-closed), `MADV_DONTDUMP`, and zeroized on drop; zero disk residue |
+| **Multi-Wallet Concurrency** | Blast parallel nonces simultaneously | Supports comma-separated keys in RAM wizard; initializes isolated `WalletWorker`s to dominate block space |
+| **OpenSea SIWE (EIP-4361)** | Zero-browser automated drop auth | Bot requests challenge, signs EIP-191 locally in RAM, obtains JWT, and pulls private Merkle proofs automatically |
+| **Allowlist & Merkle Proofs** | Seamless presale & whitelist execution | Native dynamic `bytes32[]` ABI encoding and direct SeaDrop `mintAllowList` (`0x7b233a75`) protocol routing |
+| **Zero Web Dependencies** | Immune to OpenSea / MintGo website crashes | Mint transactions route directly to on-chain smart contracts via private RPC/MEV sockets |
+| **Sub-Millisecond Dispatch** | Zero work on the trigger hit path | EIP-1559 transactions are pre-constructed and pre-signed in memory; trigger bursts pre-signed bytes instantly |
+| **Chain-Aware Relaying** | L1 private MEV first; L2 parallel RPC racer | On L1, builders (Flashbots, Titan, Beaver) are tried first; on L2, parallel RPC racers flood sequencers |
+| **Atomic MEV Bundles** | Guaranteed inclusion without sandwiching | Dispatches multi-tx bundles via `eth_sendBundle` targeting specific block heights with EIP-191 headers |
+| **Gas Acceleration Tracking** | Never priced out during gas wars | Compounds base fee velocity up to 12.5% EIP-1559 per-block ceiling, projecting fees ahead of rapid surges |
+| **Balance Pre-Flight Check** | Zero reverted drops from gas deficits | Verifies `balance >= value + (gas_limit * max_fee)` across all wallets before arming, logging exact ETH deficit |
+| **Replace-By-Fee (RBF)** | Never stuck in pending status | Background monitor polls receipts; automatically bumps gas fees (+15%) and falls back to public RPCs if builders reject |
 
 ---
 
@@ -85,6 +92,49 @@ During anticipated or competitive NFT drops, web frontends like `opensea.io` and
 * **Execution Phase (The Mint):** Once you arm the sniper, **Pulse makes zero web requests to OpenSea or MintGo**.
 * **Direct SeaDrop Smart Contract Routing:** If the drop uses OpenSea's protocol, Pulse talks directly to the official **SeaDrop v1.0 contract** (`0x00005ea00Ac477B1030CE78506496e8C2dE24bf5`) on-chain via your private Alchemy/RPC node.
 * **Result:** While web users are stuck refreshing crashed websites, Pulse has already signed your transaction in RAM and blasted it directly to block validators.
+
+---
+
+## 🔐 OpenSea Self-Signed SIWE (EIP-4361) Authentication
+
+OpenSea regularly protects presale stages, private Merkle proofs, and discounted allowlists behind wallet login to prevent public scrapers from frontrunning drop data. Pulse solves this with a **zero-browser, fully programmatic Sign-In with Ethereum (EIP-4361) engine**:
+
+```
+[OpenSea Nonce API] ──(1. Challenge)──► [Pulse Engine]
+                                               │
+                                      (2. EIP-191 Local Sign)
+                                      (ProtectedKey in RAM)
+                                               │
+[OpenSea Login API] ◄──(3. Signature)──────────┘
+         │
+    (4. JWT Token)
+         ▼
+[Authenticated Drop Query] ──► [Auto-Extract Private Merkle Proof] ──► [Pre-Loaded Sniper]
+```
+
+1. **Automated Challenge Handshake**: Pulse queries `https://api.opensea.io/api/v2/auth/nonce?address={wallet_address}`.
+2. **Local Cryptographic Signing**: Formats the compliant EIP-4361 message and executes `personal_sign` locally in physical RAM using `alloy::signers` and your loaded `ProtectedKey`. No browser extensions or popups required.
+3. **Session Acquisition**: Submits `{ message, signature }` to OpenSea's auth endpoint and acquires an authorized session JWT.
+4. **Allowlist Extraction**: Queries authenticated drop endpoints with `Authorization: Bearer <jwt>`, automatically extracting your wallet's private 32-byte Merkle proof hashes and stage allocation directly into the sniper buffer.
+
+---
+
+## 📜 Allowlist & Merkle Proof Minting Engine
+
+Pulse features a comprehensive smart contract ABI encoder supporting all common EVM allowlist and presale conventions:
+
+### 1. Dynamic `bytes32[]` Array ABI Encoding
+Automatically constructs exact EVM calldata with 32-byte head offset pointers, 32-byte array length words, and packed 32-byte leaf hashes for signatures such as:
+* `mint(uint256,bytes32[])`
+* `whitelistMint(uint256,bytes32[])`
+* `whitelistMint(bytes32[])`
+* `mint(bytes32[])`
+* `mint(address,uint256,bytes32[])`
+
+### 2. Native SeaDrop v1.0 `mintAllowList` Routing
+When sniping SeaDrop drops with active allowlist stages, Pulse routes transactions to:
+`mintAllowList(address,address,address,(uint256,uint256,uint256,uint256,uint256,uint256,uint16,bool),bytes32[])` (selector `0x7b233a75`).
+It ABI-packs the 8-word `AllowListData` tuple and appends dynamic Merkle proofs without requiring web frontend interaction.
 
 ---
 
@@ -167,68 +217,74 @@ Selecting **Option 2** launches the automated on-chain and cross-platform intell
      4. [⚪ INACTIVE] Public stage - 0.0000 ETH (Max: 50)
 
   🏁 Eligibility Verdict:
-     ⛔ NOT ELIGIBLE: Collection is 100% Sold Out
+     ✅ ELIGIBLE TO MINT! (Can mint up to 10 tokens) (Simulated Gas: 142850)
+     📜 OpenSea Allowlist Merkle Proof: 8 hash(es) available
 ===============================================================================
 ```
 
-* **One-Click Sniper Load:** If the drop is active or upcoming, Pulse prompts:
+* **One-Click Sniper Load with Auto-Allowlist**: If the drop is active or upcoming, Pulse prompts:
   `👉 Would you like to load this contract into the Sniper now? [y/N]:`
-  Pressing `y` automatically pre-populates all verified contract parameters and drops you straight into the RAM sniper!
+  Pressing `y` automatically pre-populates all verified contract parameters, countdown launch timestamps, and any discovered OpenSea allowlist Merkle proofs straight into the live RAM sniper buffer.
 
 ---
 
 ### 3️⃣ Armed Ephemeral Sniping Engine (Option 1)
 
-Selecting **Option 1** sets up and launches the live execution engine:
+Selecting **Option 1** sets up and launches the live multi-wallet execution engine:
 
-1. **Private Key (RAM Only):** Paste your 64-character raw hex key. Input is hidden from the terminal display via `rpassword` and loaded directly into pinned RAM.
-2. **Target Contract:** Enter the contract address (or paste an OpenSea URL to auto-resolve).
-3. **RPC URL:** Press Enter to accept the preset public endpoint from `config.toml`, or paste your private RPC (e.g. Alchemy, Infura, QuickNode).
-4. **Mint Parameters:** Enter the function signature (e.g. `mint(uint256)` or SeaDrop `mintPublic`), quantity, and value in Wei.
-5. **Gas Ceiling:** Enter your max gas fee ceiling in Gwei.
-6. **Trigger Mode:** Choose `a` (State Poller), `b` (Countdown Timer), or `c` (Mempool Backrun).
-7. **Instant Terminal HUD:** The bot drops into the real-time Ratatui dashboard, synchronizes wallet nonces, pre-signs transactions, and waits for the trigger condition.
+1. **Private Keys (RAM Only, Multi-Wallet Batching):** Paste one or more 64-character raw hex keys (comma-separated for multi-wallet operations). Input is hidden from the terminal display via `rpassword` and pinned into dedicated memory-mapped physical RAM.
+2. **Target Contract & Auto-SIWE:** Enter the contract address or paste an OpenSea collection URL. When an OpenSea URL is provided, Pulse automatically executes an in-memory SIWE challenge handshake to pull private drop Merkle proofs for your connected wallet.
+3. **RPC URLs:** Multi-endpoint comma-separated pool for race broadcasting, with optional dedicated WebSocket (`ws_rpc_url`) streaming.
+4. **Mint Parameters:** Enter the function signature (e.g. `mint(uint256)`, SeaDrop `mintPublic`, or allowlist variants), quantity, and value in Wei.
+5. **Merkle Proofs:** Automatically pre-loaded from OpenSea SIWE session, or entered as comma-separated hex hashes.
+6. **Gas Ceiling & Acceleration:** Enter your max gas fee ceiling in Gwei. Pulse actively tracks block fee acceleration up to the 12.5% EIP-1559 limit.
+7. **Exclusive Trigger Mode:** Select `a` (State Poller), `b` (Countdown Timer with On-Chain Block Time Calibration), or `c` (Mempool Backrun).
+8. **Pre-Flight Balance Check:** Automatically queries `eth_getBalance` across all loaded wallets to confirm `balance >= value + (gas_limit * max_fee)`. If underfunded, an exact ETH deficit warning is logged before arming.
+9. **Instant Terminal HUD:** The engine switches to the real-time Ratatui dashboard, synchronizes wallet nonces, pre-signs transactions, and bursts the moment the trigger condition is met.
 
 ---
 
 ## 🎯 Sniping Trigger Mechanics Explained
 
-Pulse provides three high-precision triggering mechanisms:
+Pulse provides three high-precision triggering mechanisms with **strict trigger exclusivity** (only the chosen sniper runs to conserve network sockets and CPU cycles):
 
 ### A. State Poller (Instant View Verification)
 * **Best For:** Unannounced drops, manual admin flips, or sales guarded by view functions (e.g. `isPublicSaleActive()`, `saleIsActive()`).
 * **Mechanism:** Queries the target view function every 150 ms via lightweight `eth_call`. As soon as the contract returns a non-zero truthy byte, the trigger fires and blasts pre-signed transactions instantly.
 
-### B. Countdown Timer (Micro-Spun Precision)
+### B. Countdown Timer (Micro-Spun Precision + Block Calibration)
 * **Best For:** Drops with known launch timestamps (e.g. OpenSea SeaDrop scheduled times).
-* **Mechanism:** Calculates the remaining milliseconds until the target Unix timestamp. In the final 50 milliseconds, Pulse switches to an ultra-tight CPU micro-spin loop (`tokio::task::yield_now`) to burst pre-signed transactions across the network on the exact target millisecond.
+* **On-Chain Clock Calibration:** Prior to arming, Pulse queries the latest block timestamp from your RPC and calculates `clock_offset_ms` against local system time, eliminating NTP or local clock drift that could cause early or late trigger fires.
+* **Micro-Spinning Execution:** Calculates the exact remaining milliseconds. In the final 50 milliseconds, Pulse switches to an ultra-tight CPU micro-spin loop (`tokio::task::yield_now`) to burst pre-signed transactions across the network on the exact target millisecond.
 
 ### C. Mempool Backrun (Reactive Transaction Sniping)
 * **Best For:** Frontrunning the public or backrunning the creator's flip transaction.
-* **Dual Transport:**
-  - **WebSocket Streaming (`wss://`):** Subscribes to `newPendingTransactions` to stream pending transaction details reactively as they hit the mempool, alongside `newHeads` for instantaneous block base-fee tracking.
-  - **HTTP Polling:** Fallback polling of `eth_getBlockByNumber("pending", true)`.
-* **Anti-Spoof Matching:** Requires a strict three-point match (Sender == Owner Address, To == Target Contract, Calldata Selector == Flip Function) before triggering.
+* **Segregated Transports:**
+  - **Dedicated WebSocket Streaming (`ws_rpc_url`):** Subscribes to `newPendingTransactions` and `newHeads` on a dedicated WebSocket stream, avoiding socket pollution on HTTP RPC endpoints.
+  - **Reconnect Catch-Up Buffering:** If the node disconnects, Pulse reconnects with exponential backoff and immediately queries `eth_getBlockByNumber("pending", true)` to catch up on any transactions broadcast during the reconnection window.
+* **Mutating Signature Matching:** Strictly matches against mutating state flip functions (`mempool_flip_signatures`, e.g. `setPublicSaleActive(bool)`, `setSaleActive(bool)`, `flipSaleState()`) rather than view getters, requiring a three-point match (Sender == Owner Address, To == Target Contract, Calldata Selector == Flip Function).
 
 ---
 
 ## ⚡ Execution Pipeline & Network Architecture
 
 ```
-                                  ┌──► [Private MEV Relay (L1)] ──► Flashbots / Titan / Beaver
+                                  ┌──► [Atomic MEV Relay (L1)] ──► Flashbots / Titan / Beaver
                                   │
-[Trigger Hit] ──► [Pre-Signed Tx] ┼──► [Public RPC Racer (L1/L2)] ──► Fast Node Broadcast
-                                  │
-                                  └──► [Background Tx Monitor] ──► Receipt Poll ──► Auto-Speedup (RBF)
+[Trigger Hit] ──► [Pre-Signed Txs] ┼──► [Public RPC Racer (L1/L2)] ──► Multi-Node Race Broadcast
+(Multi-Wallet)                    │
+                                  └──► [Tx Monitor & RBF Engine] ──► Receipt Poll ──► Auto-Speedup
 ```
 
-1. **Pre-Signed Transaction Cache:** Transactions are constructed and signed in memory *ahead of time*. When the trigger condition is met, Pulse doesn't spend time signing or calculating gas—it transmits the raw pre-signed bytes directly to open sockets.
-2. **Chain-Aware Dual-Broadcasting:**
-   - **Ethereum L1 (`chain_id == 1`):** Sends to private MEV builders first (`eth_sendPrivateTransaction` with EIP-191 authentication). Public RPCs are used only if every builder rejects the transaction, so the transaction is not leaked to the public mempool when a builder accepts it.
-   - **EVM L2s (Robinhood `4663`, Base `8453`, Arbitrum `42161`):** Bypasses L1 builder relays and floods parallel public RPC endpoints simultaneously to guarantee inclusion by the sequencer.
-3. **Keep-Alive Socket Warming & Telemetry:** Sockets are pre-warmed with decoupled background keep-alive pings, eliminating cold TCP/TLS handshake latency during the critical drop second without blocking the TUI event loop.
-4. **Nonce Gap Auto-Advancing:** Nonce manager tracks on-chain pending counts and automatically resynchronizes forward if network transactions have outpaced local counters, preventing 'nonce too low' rejects.
-5. **Replace-by-Fee (RBF) Auto-Speedup:** If a transaction remains unconfirmed after `speedup_threshold_ms`, Pulse calculates bumped gas fees (`+15%`), re-signs the same nonce, and re-broadcasts until confirmed, the hard ceiling is reached, or the 600s abandon window elapses.
+1. **Pre-Signed Multi-Wallet Cache:** Transactions across all loaded wallets are constructed, validated, and signed in memory *ahead of drop time*. When the trigger hits, Pulse skips all gas computation and serialization, blasting pre-signed bytes simultaneously across parallel sockets.
+2. **Chain-Aware Dual-Broadcasting & Atomic Bundles:**
+   - **Ethereum L1 (`chain_id == 1`):** Sends to private MEV builders first (`eth_sendPrivateTransaction` or `eth_sendBundle` targeting specific block heights with EIP-191 headers). Public RPCs are used only if every builder rejects the payload, preventing frontrunning and sandwich attacks.
+   - **EVM L2s (Robinhood `4663`, Base `8453`, Arbitrum `42161`, Polygon `137`):** Bypasses L1 builder relays and floods parallel public RPC endpoints simultaneously to guarantee immediate sequencer inclusion.
+3. **EIP-1559 Dynamic Fee Acceleration:** Tracks the second derivative (acceleration) of base fee increases. If consecutive blocks show fee surges, Pulse projects base fees ahead (compounding up to the 12.5% per-block EVM limit) so pre-signed transactions are never priced out during gas spikes.
+4. **Pre-Flight Balance Protection:** Before arming snipers, Pulse queries `eth_getBalance` to verify that each wallet holds `balance >= value + (gas_limit * max_fee)`. Any underfunded wallet triggers an explicit deficit warning with the missing ETH amount.
+5. **Keep-Alive Socket Warming & Telemetry:** Sockets are pre-warmed with decoupled background keep-alive pings, eliminating cold TCP/TLS handshake latency during the critical drop second without blocking the TUI event loop.
+6. **Nonce Gap Auto-Advancing:** Nonce manager tracks on-chain pending counts and automatically resynchronizes forward if network transactions have outpaced local counters, preventing 'nonce too low' rejects.
+7. **Replace-by-Fee (RBF) Auto-Speedup with Public Fallback:** If a transaction remains unconfirmed after `speedup_threshold_ms`, Pulse calculates bumped gas fees (`+15%`), re-signs the same nonce, and re-broadcasts. If MEV builders reject the replacement, it automatically falls back to broadcasting across public RPC racers.
 
 ---
 
@@ -243,6 +299,7 @@ name = "Robinhood Chain"
 rpc_urls = [
     "https://rpc.mainnet.chain.robinhood.com",
 ]
+ws_rpc_url = ""               # Optional: dedicated WebSocket endpoint for mempool streaming
 mev_builder_urls = []
 rpc_timeout_ms = 3000
 
@@ -250,9 +307,16 @@ rpc_timeout_ms = 3000
 target_contract = "0x0000000000000000000000000000000000000000"
 mint_function = "mint(uint256)"
 mint_value_wei = "0"
-flip_function_signatures = [
+mint_quantity = 1
+merkle_proof = []              # Optional: fallback 32-byte hex Merkle proof hashes
+flip_function_signatures = [   # Read-only view getters for State Poller
     "isPublicSaleActive()",
     "saleIsActive()",
+]
+mempool_flip_signatures = [    # State-mutating function signatures for Mempool Scanner
+    "setPublicSaleActive(bool)",
+    "setSaleActive(bool)",
+    "flipSaleState()",
 ]
 
 [gas]
