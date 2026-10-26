@@ -46,7 +46,8 @@ pub fn spawn_tx_monitor(
             if started.elapsed() >= MONITOR_ABANDON_AFTER {
                 if let Some(on_chain_nonce) = rpc_racer.fetch_transaction_count(&tx.worker.address).await {
                     if on_chain_nonce > tx.nonce {
-                        tx.worker.nonce_mgr.set_nonce(on_chain_nonce);
+                        // Monotonic: this observation may be staler than another writer's.
+                        tx.worker.nonce_mgr.advance(on_chain_nonce);
                     }
                 }
                 let _ = ui_log_tx
@@ -112,7 +113,7 @@ pub fn spawn_tx_monitor(
                                 on_chain_nonce, tx.nonce
                             ))
                             .await;
-                        tx.worker.nonce_mgr.set_nonce(on_chain_nonce);
+                        tx.worker.nonce_mgr.advance(on_chain_nonce);
                         break;
                     }
                 }

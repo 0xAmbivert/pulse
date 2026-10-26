@@ -205,9 +205,11 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 };
 
                 // 5. Mint Value in Wei (Optional: Enter for default). Invalid input re-prompts.
+                // This is the PER-TOKEN unit price; the engine multiplies it by quantity to
+                // build `msg.value` (SeaDrop requires `msg.value == quantity * mintPrice`).
                 let default_val_wei = detected_price_wei.unwrap_or_else(|| base_config.drop.mint_value_wei.clone());
                 let mint_value_wei = loop {
-                    print!("5️⃣  Enter Mint Value in Wei (Press Enter for '{default_val_wei}'): ");
+                    print!("5️⃣  Enter Unit Mint Price in Wei (per token, Press Enter for '{default_val_wei}'): ");
                     io::stdout().flush()?;
                     let Some(val_input) = read_line_opt()? else { return Ok(MenuAction::Exit); };
                     let trimmed = val_input.trim();
@@ -230,6 +232,22 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                     }
                 };
 
+                // Surface the total native value up front: this is what actually leaves the
+                // wallet, and a mismatch with the contract's expectation reverts the mint.
+                if let Ok(unit) = mint_value_wei.trim().parse::<u128>() {
+                    match unit.checked_mul(mint_quantity as u128) {
+                        Some(total) if total > 0 => println!(
+                            "💸 Total native value per wallet: {} Wei ({:.6} ETH) = {} x {}",
+                            total,
+                            total as f64 / 1e18,
+                            mint_quantity,
+                            unit
+                        ),
+                        Some(_) => {}
+                        None => println!("❌ Unit price {} Wei x quantity {} overflows; reduce either value.", unit, mint_quantity),
+                    }
+                }
+
                 // 7. Max Gas Fee in Gwei (Optional: Enter for default). Invalid input re-prompts.
                 let max_gas_fee = loop {
                     print!("7️⃣  Enter Max Gas Fee in Gwei (Press Enter for '{:.1}'): ", base_config.gas.max_fee_gwei);
@@ -244,15 +262,10 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 };
 
                 // 8. Snipe Trigger Mode Selection
-                println!("\n🎯 Select Sniping Trigger Mode:");
-                println!("   a) Instant / State Poller (Watches when contract sale flips active)");
-                println!("   b) Countdown Timer (Target Unix timestamp)");
-                println!("   c) Mempool Backrun (Watches owner transaction)");
+                println!("\n🎯 Select Sniping Trigger Mode:\n   a) Instant / State Poller (Watches when contract sale flips active)\n   b) Countdown Timer (Target Unix timestamp)\n   c) Mempool Backrun (Watches owner transaction)");
                 print!("👉 Choose trigger mode [a/b/c] (default 'a'): ");
                 io::stdout().flush()?;
-                let Some(trigger_choice) = read_line_opt()? else {
-                    return Ok(MenuAction::Exit);
-                };
+                let Some(trigger_choice) = read_line_opt()? else { return Ok(MenuAction::Exit); };
 
                 let mut target_timestamp = None;
                 let mut monitor_owner_address = None;
@@ -260,21 +273,15 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                     "b" => {
                         print!("   Enter Target Unix Timestamp: ");
                         io::stdout().flush()?;
-                        let Some(ts_str) = read_line_opt()? else {
-                            return Ok(MenuAction::Exit);
-                        };
+                        let Some(ts_str) = read_line_opt()? else { return Ok(MenuAction::Exit); };
                         target_timestamp = ts_str.trim().parse::<u64>().ok();
                         crate::config::TriggerMode::Countdown
                     }
                     "c" => {
                         print!("   Enter Owner Address to Monitor: ");
                         io::stdout().flush()?;
-                        let Some(owner_str) = read_line_opt()? else {
-                            return Ok(MenuAction::Exit);
-                        };
-                        if !owner_str.trim().is_empty() {
-                            monitor_owner_address = Some(owner_str.trim().to_string());
-                        }
+                        let Some(owner_str) = read_line_opt()? else { return Ok(MenuAction::Exit); };
+                        if !owner_str.trim().is_empty() { monitor_owner_address = Some(owner_str.trim().to_string()); }
                         crate::config::TriggerMode::Mempool
                     }
                     _ => crate::config::TriggerMode::StatePoller,

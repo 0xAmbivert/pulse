@@ -1,11 +1,49 @@
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
+/// One RPC endpoint plus its live health flag.
+///
+/// Health used to be frozen at construction time, so a dead endpoint stayed in every
+/// race forever (and a recovered one was never re-admitted). It is now updated from real
+/// probe results: `benchmark_latencies` is the health probe and re-admits endpoints,
+/// while broadcast/query failures demote them.
 pub struct RpcEndpoint {
     pub url: String,
-    pub is_healthy: bool,
+    healthy: AtomicBool,
+}
+
+impl RpcEndpoint {
+    pub fn new(url: String, healthy: bool) -> Self {
+        Self {
+            url,
+            healthy: AtomicBool::new(healthy),
+        }
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Relaxed)
+    }
+
+    pub fn set_healthy(&self, healthy: bool) {
+        self.healthy.store(healthy, Ordering::Relaxed);
+    }
+}
+
+impl Clone for RpcEndpoint {
+    fn clone(&self) -> Self {
+        Self::new(self.url.clone(), self.is_healthy())
+    }
+}
+
+impl std::fmt::Debug for RpcEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcEndpoint")
+            .field("url", &self.url)
+            .field("healthy", &self.is_healthy())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -39,10 +77,7 @@ impl RpcRacer {
                 if is_ws {
                     eprintln!("⚠️ WARNING: WebSocket URL detected: {}. RpcRacer requires HTTP/HTTPS endpoints. Marking inactive.", url);
                 }
-                RpcEndpoint {
-                    url: url.clone(),
-                    is_healthy: !is_ws,
-                }
+                RpcEndpoint::new(url.clone(), !is_ws)
             })
             .collect();
 
@@ -53,13 +88,13 @@ impl RpcRacer {
     }
 
     /// Pings all configured RPC endpoints concurrently to evaluate response times and keep connection pools warm.
+    ///
+    /// This doubles as the health probe: endpoints that fail are demoted, and previously
+    /// demoted endpoints are re-probed so a transient outage cannot disable one permanently.
     pub async fn benchmark_latencies(&self) -> Vec<(String, Option<u64>)> {
         let mut tasks = Vec::new();
 
         for endpoint in &self.endpoints {
-            if !endpoint.is_healthy {
-                continue;
-            }
             let client = self.client.clone();
             let url = endpoint.url.clone();
             tasks.push(tokio::spawn(async move {
@@ -83,12 +118,23 @@ impl RpcRacer {
 
         let mut results = Vec::new();
         for task in tasks {
-            if let Ok(res) = task.await {
-                results.push(res);
+            if let Ok((url, latency)) = task.await {
+                self.mark_health(&url, latency.is_some());
+                results.push((url, latency));
             }
         }
 
         results
+    }
+
+    /// Updates an endpoint's health flag by URL. Unknown URLs are ignored.
+    fn mark_health(&self, url: &str, healthy: bool) {
+        for ep in &self.endpoints {
+            if ep.url == url {
+                ep.set_healthy(healthy);
+                return;
+            }
+        }
     }
 
     /// Broadcasts a signed raw transaction in parallel across all healthy endpoints simultaneously.
@@ -103,7 +149,7 @@ impl RpcRacer {
         let mut handles = Vec::new();
 
         for ep in &self.endpoints {
-            if !ep.is_healthy {
+            if !ep.is_healthy() {
                 continue;
             }
             let client = self.client.clone();
@@ -177,6 +223,17 @@ impl RpcRacer {
             }
         }
 
+        // Demote endpoints that could not even complete the transport-level send.
+        for outcome in &outcomes {
+            if !outcome.success {
+                if let Some(ref err) = outcome.error {
+                    if is_transport_failure(err) {
+                        self.mark_health(&outcome.rpc_url, false);
+                    }
+                }
+            }
+        }
+
         outcomes
     }
 
@@ -195,7 +252,7 @@ impl RpcRacer {
                 "id": 1
             });
             for ep in &self.endpoints {
-                if !ep.is_healthy {
+                if !ep.is_healthy() {
                     continue;
                 }
                 let client = self.client.clone();
@@ -249,7 +306,7 @@ impl RpcRacer {
         let mut tasks = FuturesUnordered::new();
 
         for ep in &self.endpoints {
-            if !ep.is_healthy {
+            if !ep.is_healthy() {
                 continue;
             }
             let client = self.client.clone();
@@ -329,5 +386,99 @@ impl RpcRacer {
 
     pub fn endpoints(&self) -> &[RpcEndpoint] {
         &self.endpoints
+    }
+}
+
+/// Distinguishes "this endpoint is broken" from "this endpoint answered and refused".
+///
+/// A node that rejects a transaction on its merits (`nonce too low`, `already known`,
+/// `insufficient funds`, `replacement transaction underpriced`) is healthy — demoting it
+/// would disable a perfectly good node during normal operation. Only transport-level and
+/// rate-limit failures indicate an endpoint that should be taken out of the rotation.
+fn is_transport_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    const NODE_VERDICTS: [&str; 8] = [
+        "nonce too low",
+        "already known",
+        "known transaction",
+        "replacement transaction underpriced",
+        "insufficient funds",
+        "intrinsic gas too low",
+        "exceeds block gas limit",
+        "execution reverted",
+    ];
+    if NODE_VERDICTS.iter().any(|verdict| lower.contains(verdict)) {
+        return false;
+    }
+
+    // reqwest transport errors, HTTP statuses surfaced by error_for_status, and rate limits.
+    const TRANSPORT_MARKERS: [&str; 7] = [
+        "error sending request",
+        "connection refused",
+        "connection reset",
+        "timed out",
+        "timeout",
+        "429",
+        "503",
+    ];
+    TRANSPORT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_verdicts_do_not_demote_endpoints() {
+        for verdict in [
+            "nonce too low",
+            "ALREADY KNOWN",
+            "replacement transaction underpriced",
+            "insufficient funds for gas * price + value",
+        ] {
+            assert!(
+                !is_transport_failure(verdict),
+                "{verdict:?} is a node verdict, not a transport failure"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_failures_demote_endpoints() {
+        for failure in [
+            "error sending request for url (https://rpc.example)",
+            "connection refused",
+            "operation timed out",
+            "HTTP 429 Too Many Requests",
+        ] {
+            assert!(
+                is_transport_failure(failure),
+                "{failure:?} should demote the endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn health_flag_round_trips() {
+        let ep = RpcEndpoint::new("https://a.example".to_string(), true);
+        assert!(ep.is_healthy());
+        ep.set_healthy(false);
+        assert!(!ep.is_healthy());
+        // Clone must carry the current flag, not a stale snapshot.
+        let cloned = ep.clone();
+        assert!(!cloned.is_healthy());
+    }
+
+    #[test]
+    fn websocket_endpoints_are_marked_inactive() {
+        let racer = RpcRacer::new(
+            &["wss://ws.example".to_string(), "https://http.example".to_string()],
+            1000,
+        );
+        let eps = racer.endpoints();
+        assert!(!eps[0].is_healthy(), "ws endpoint must be inactive");
+        assert!(eps[1].is_healthy(), "http endpoint must be active");
     }
 }

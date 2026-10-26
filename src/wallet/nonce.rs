@@ -27,8 +27,26 @@ impl NonceManager {
     }
 
     /// Sets the nonce explicitly.
+    ///
+    /// This overwrites unconditionally, so it is only safe for deliberate resets (startup
+    /// and explicit `resync_from_rpc`). Background observers must use [`Self::advance`].
     pub fn set_nonce(&self, nonce: u64) {
         self.current_nonce.store(nonce, Ordering::SeqCst);
+    }
+
+    /// Moves the nonce forward to `nonce` if it is ahead, never backwards.
+    ///
+    /// Chain observers (the receipt monitor, nonce-gap detection) learn on-chain state
+    /// asynchronously and can be overtaken. A plain store from a stale observation would
+    /// rewind the counter and make the next transaction reuse a consumed nonce, which the
+    /// node rejects with `nonce too low`. `fetch_max` keeps the counter monotonic under
+    /// concurrent writers.
+    ///
+    /// Returns the value in effect after the update.
+    pub fn advance(&self, nonce: u64) -> u64 {
+        // `fetch_max` returns the *previous* value, so reload to report the current one.
+        let previous = self.current_nonce.fetch_max(nonce, Ordering::SeqCst);
+        previous.max(nonce)
     }
 
     /// Rolls back a reserved nonce only if no later nonce was reserved since.
@@ -83,5 +101,26 @@ mod tests {
         assert_eq!(mgr.current(), 6);
         mgr.set_nonce(10);
         assert_eq!(mgr.current(), 10);
+    }
+
+    #[test]
+    fn test_advance_never_rewinds() {
+        let mgr = NonceManager::new("0x1234567890123456789012345678901234567890", 10);
+        // A stale observation from a lagging endpoint must not rewind the counter.
+        assert_eq!(mgr.advance(7), 10);
+        assert_eq!(mgr.current(), 10);
+        // A newer observation moves it forward.
+        assert_eq!(mgr.advance(12), 12);
+        assert_eq!(mgr.current(), 12);
+    }
+
+    #[test]
+    fn test_advance_is_monotonic_across_reservation() {
+        let mgr = NonceManager::new("0x1234567890123456789012345678901234567890", 0);
+        assert_eq!(mgr.get_and_increment(), 0);
+        assert_eq!(mgr.get_and_increment(), 1);
+        // Chain confirms nonce 0 only; reserving 1 locally must survive the sync.
+        assert_eq!(mgr.advance(1), 2);
+        assert_eq!(mgr.current(), 2);
     }
 }

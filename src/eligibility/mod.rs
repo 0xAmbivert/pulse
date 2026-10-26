@@ -2,6 +2,7 @@ pub mod checker;
 pub mod mintgo;
 pub mod opensea;
 pub mod seadrop;
+pub mod seadrop_calldata;
 pub mod types;
 
 pub use checker::EligibilityChecker;

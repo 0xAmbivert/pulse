@@ -5,7 +5,8 @@ use crate::eligibility::types::SeaDropPublicConfig;
 
 pub const SEADROP_V1_ADDRESS: &str = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
 pub const SEADROP_MINT_PUBLIC_SELECTOR: [u8; 4] = [0x16, 0x1a, 0xc2, 0x1f];
-pub const SEADROP_MINT_ALLOWLIST_SELECTOR: [u8; 4] = [0x7b, 0x23, 0x3a, 0x75];
+/// `mintAllowList(address,address,address,uint256,(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),bytes32[])`
+pub const SEADROP_MINT_ALLOWLIST_SELECTOR: [u8; 4] = [0x43, 0x00, 0xa4, 0xe6];
 
 pub struct SeaDropInspector {
     rpc_url: String,
@@ -186,20 +187,23 @@ impl SeaDropInspector {
 }
 
 /// Decodes common SeaDrop and ERC-721 custom error selectors into human-readable reasons.
+///
+/// Selectors verified against the canonical `ProjectOpenSea/seadrop` error definitions
+/// (`src/interfaces/ISeaDrop.sol`) and the 4byte signature database.
 pub fn decode_revert_reason(data: &str, fallback_msg: &str) -> String {
     let clean = data.trim_start_matches("0x");
     if clean.len() >= 8 {
         let selector = &clean[0..8];
         match selector {
             "e12d2314" => return "Drop is Sold Out (MintQuantityExceedsMaxSupply)".to_string(),
-            "a6fd7170" => return "Drop Stage is Not Active (NotActive)".to_string(),
-            "d845e2c5" => return "Wallet Limit Reached (MintQuantityExceedsMaxMintedPerWallet)".to_string(),
+            "13da22f2" => return "Drop Stage is Not Active (NotActive)".to_string(),
+            "edc01273" => return "Wallet Limit Reached (MintQuantityExceedsMaxMintedPerWallet)".to_string(),
             "09bde339" => return "Not on Allowlist / Invalid Merkle Proof (InvalidProof)".to_string(),
-            "d368bb8d" => return "Incorrect Payment Value Sent (IncorrectPayment)".to_string(),
-            "c8bf2286" => return "Mint Quantity Cannot Be Zero (MintQuantityCannotBeZero)".to_string(),
-            "9484b80b" => return "Signer Not Present on Drop (SignerNotPresent)".to_string(),
-            "8baa579f" => return "Invalid Server-Side Signature (InvalidSignature)".to_string(),
-            "5e548816" => return "Fee Recipient Not Allowed (FeeRecipientNotAllowed)".to_string(),
+            "0d35e921" => return "Incorrect Payment Value Sent (IncorrectPayment)".to_string(),
+            "198441cb" => return "Mint Quantity Cannot Be Zero (MintQuantityCannotBeZero)".to_string(),
+            "b40637e4" => return "Signer Not Present on Drop (SignerNotPresent)".to_string(),
+            "d855c4f4" => return "Invalid Server-Side Signature (InvalidSignature)".to_string(),
+            "f477d26f" => return "Fee Recipient Not Allowed (FeeRecipientNotAllowed)".to_string(),
             "4e487b71" => return "Panic / Integer Overflow (Panic)".to_string(),
             "08c379a0" => {
                 // Standard Error(string): selector, offset word, length word, then UTF-8 bytes.
@@ -247,12 +251,16 @@ mod tests {
             "Drop is Sold Out (MintQuantityExceedsMaxSupply)"
         );
         assert_eq!(
-            decode_revert_reason("0xa6fd7170000000", "revert"),
+            decode_revert_reason("0x13da22f2000000", "revert"),
             "Drop Stage is Not Active (NotActive)"
         );
         assert_eq!(
             decode_revert_reason("0x09bde339000000", "revert"),
             "Not on Allowlist / Invalid Merkle Proof (InvalidProof)"
+        );
+        assert_eq!(
+            decode_revert_reason("0x0d35e921000000", "revert"),
+            "Incorrect Payment Value Sent (IncorrectPayment)"
         );
     }
 }

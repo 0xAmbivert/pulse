@@ -243,8 +243,8 @@ impl DropConfig {
         Ok(data)
     }
 
-    /// Builds exact SeaDrop mintAllowList calldata:
-    /// mintAllowList(address,address,address,(uint256,uint256,uint256,uint256,uint256,uint256,uint16,bool),bytes32[])
+    /// Builds exact SeaDrop `mintAllowList` calldata (selector `0x4300a4e6`).
+    /// `quantity` precedes the inlined `MintParams` tuple; proof offset is 13 words = 416 bytes.
     #[allow(clippy::too_many_arguments)]
     pub fn build_seadrop_allowlist_calldata(
         &self,
@@ -257,15 +257,17 @@ impl DropConfig {
         wallet_limit: u64,
     ) -> Result<Vec<u8>, String> {
         let (w1, w2, w3) = self.seadrop_addrs(minter)?;
-        let mint_price = self.mint_value_wei.trim().parse::<u128>().unwrap_or(0);
+        let mint_price = self.mint_value_wei.trim().parse::<u128>()
+            .map_err(|e| format!("Invalid mint_value_wei '{}': {e}", self.mint_value_wei))?;
 
-        let mut data = Vec::with_capacity(4 + 32 * (13 + self.merkle_proof.len()));
-        data.extend_from_slice(&[0x7b, 0x23, 0x3a, 0x75]);
+        let mut data = Vec::with_capacity(4 + 32 * (14 + self.merkle_proof.len()));
+        data.extend_from_slice(&crate::eligibility::seadrop::SEADROP_MINT_ALLOWLIST_SELECTOR);
         data.extend_from_slice(&w1);
         data.extend_from_slice(&w2);
         data.extend_from_slice(&w3);
+        data.extend_from_slice(&u256_word(quantity));
 
-        // AllowListData tuple: 8 static words
+        // MintParams tuple: 8 static words, inlined.
         let mut price_word = [0u8; 32];
         price_word[16..32].copy_from_slice(&mint_price.to_be_bytes());
         data.extend_from_slice(&price_word);
@@ -279,8 +281,7 @@ impl DropConfig {
         data.extend_from_slice(&u256_word(fee_bps as u64));
         data.extend_from_slice(&u256_word(0)); // restrictFeeRecipients (bool)
 
-        // Offset pointer to bytes32[]: 12 words * 32 bytes = 384 (0x0180)
-        data.extend_from_slice(&u256_word(384));
+        data.extend_from_slice(&u256_word(416)); // proof offset: 13 * 32 = 416
         data.extend_from_slice(&encode_bytes32_slice(&self.merkle_proof)?);
         Ok(data)
     }
@@ -418,7 +419,16 @@ mod tests {
         assert_eq!(&keccak256("getAllowedFeeRecipients(address)")[0..4], &[0x68, 0x63, 0x22, 0x74]);
         assert_eq!(&keccak256("getAllowListMerkleRoot(address)")[0..4], &[0x32, 0xbf, 0x11, 0xf5]);
         assert_eq!(&keccak256("mintPublic(address,address,address,uint256)")[0..4], &[0x16, 0x1a, 0xc2, 0x1f]);
-        assert_eq!(crate::eligibility::seadrop::SEADROP_MINT_ALLOWLIST_SELECTOR, [0x7b, 0x23, 0x3a, 0x75]);
+        assert_eq!(
+            &keccak256(
+                "mintAllowList(address,address,address,uint256,(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),bytes32[])"
+            )[0..4],
+            &[0x43, 0x00, 0xa4, 0xe6]
+        );
+        assert_eq!(
+            crate::eligibility::seadrop::SEADROP_MINT_ALLOWLIST_SELECTOR,
+            [0x43, 0x00, 0xa4, 0xe6]
+        );
     }
 
     #[test]
@@ -464,21 +474,24 @@ mod tests {
         };
         let caller = "0x1111111111111111111111111111111111111111";
         let calldata = drop.build_dispatch_calldata(Some(caller), 2).unwrap();
-        assert_eq!(&calldata[0..4], &[0x7b, 0x23, 0x3a, 0x75]);
-        assert_eq!(calldata.len(), 4 + 32 * 14);
+        assert_eq!(&calldata[0..4], &[0x43, 0x00, 0xa4, 0xe6]);
+        // selector + 4 top-level words + 8 tuple words + offset + length + 1 proof
+        assert_eq!(calldata.len(), 4 + 32 * 15);
 
-        // Word 4 (idx 4 + 4*32): maxTotalMintableByWallet = 5
-        assert_eq!(calldata[4 + 4 * 32 + 31], 5);
-        // Word 6 (idx 4 + 6*32): endTime = 1_800_000_000
-        let end_idx = 4 + 6 * 32;
+        // Word 3: top-level `quantity`
+        assert_eq!(calldata[4 + 3 * 32 + 31], 2);
+        // Word 5: maxTotalMintableByWallet = 5
+        assert_eq!(calldata[4 + 5 * 32 + 31], 5);
+        // Word 7: endTime = 1_800_000_000
+        let end_idx = 4 + 7 * 32;
         assert_eq!(u64::from_be_bytes(calldata[end_idx + 24..end_idx + 32].try_into().unwrap()), 1_800_000_000);
-        // Word 7 (idx 4 + 7*32): dropStageIndex = 1
-        assert_eq!(calldata[4 + 7 * 32 + 31], 1);
-        // Word 9 (idx 4 + 9*32): feeBps = 250
-        assert_eq!(calldata[4 + 9 * 32 + 31], 250);
-        // Word 11 is offset to bytes32[]: 384 (0x0180)
-        let offset_idx = 4 + 11 * 32 + 30;
+        // Word 8: dropStageIndex = 1
+        assert_eq!(calldata[4 + 8 * 32 + 31], 1);
+        // Word 10: feeBps = 250
+        assert_eq!(calldata[4 + 10 * 32 + 31], 250);
+        // Word 12 is the offset to bytes32[]: 416 (0x01a0)
+        let offset_idx = 4 + 12 * 32 + 30;
         assert_eq!(calldata[offset_idx], 1);
-        assert_eq!(calldata[offset_idx + 1], 0x80);
+        assert_eq!(calldata[offset_idx + 1], 0xa0);
     }
 }

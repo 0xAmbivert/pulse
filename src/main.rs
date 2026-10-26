@@ -9,56 +9,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use pulse::alerts::AlertDispatcher;
+use pulse::alerts::{open_log_file, AlertDispatcher};
 use pulse::config::{AppConfig, TriggerMode};
 use pulse::gas::{wei_to_gwei, GasEngine};
 use pulse::network::{MevBuilderClient, RpcRacer};
 use pulse::simulation::RpcSimulator;
-use pulse::sniper::{CountdownSniper, MempoolScanner, SnipeTrigger, StatePoller};
+use pulse::sniper::{
+    apply_decision, classify_trigger, prepare_snipes, CountdownSniper, DispatchState,
+    MempoolScanner, SnipeTrigger, StatePoller, TriggerDecision,
+};
 use pulse::ui::{draw_ui, run_interactive_menu, AppEvent, DashboardState, EventHandler, MenuAction};
 use pulse::wallet::{spawn_tx_monitor, SubmittedTx, WalletWorker};
-
-#[derive(Clone)]
-struct PreparedSnipe {
-    worker: Arc<WalletWorker>,
-    raw_tx: String,
-    tx_hash: String,
-    nonce: u64,
-    max_fee_wei: u128,
-    priority_fee_wei: u128,
-    calldata: Vec<u8>,
-    value_wei: u128,
-}
-
-fn prepare_snipes(
-    workers: &[Arc<WalletWorker>],
-    config: &AppConfig,
-    target_contract: &str,
-    current_base_fee_wei: u128,
-    prev_base_fee_wei: Option<u128>,
-    gas_engine: &GasEngine,
-) -> Result<Vec<PreparedSnipe>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut snipes = Vec::with_capacity(workers.len());
-    let (max_fee_wei, max_prio_wei) = gas_engine.calculate_dynamic_fees_with_acceleration(current_base_fee_wei, prev_base_fee_wei, 1, None)?;
-    let value = config.drop.mint_value_wei.parse::<u128>()
-        .map_err(|e| format!("Invalid mint value in wei '{}': {e}", config.drop.mint_value_wei))?;
-    let destination = config.drop.get_dispatch_destination(target_contract);
-
-    for worker in workers {
-        let calldata = config.drop.build_dispatch_calldata(Some(&worker.address), config.drop.mint_quantity)?;
-        let nonce = worker.nonce_mgr.current();
-        let (raw_tx, n) = worker.build_and_sign_eip1559(
-            config.chain.chain_id, destination, &calldata, value, config.gas.gas_limit, max_fee_wei, max_prio_wei, Some(nonce),
-        )?;
-        let tx_bytes = hex::decode(raw_tx.trim_start_matches("0x"))
-            .map_err(|e| format!("Signed transaction is not valid hex: {e}"))?;
-        let tx_hash = format!("{:#x}", alloy::primitives::keccak256(&tx_bytes));
-        snipes.push(PreparedSnipe {
-            worker: worker.clone(), raw_tx, tx_hash, nonce: n, max_fee_wei, priority_fee_wei: max_prio_wei, calldata, value_wei: value,
-        });
-    }
-    Ok(snipes)
-}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -76,16 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
     pulse::crypto::harden_process();
 
-    #[cfg(unix)]
-    let log_opts = {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut o = std::fs::OpenOptions::new();
-        o.create(true).append(true).mode(0o600);
-        o
-    };
-    #[cfg(not(unix))]
-    let log_opts = { let mut o = std::fs::OpenOptions::new(); o.create(true).append(true); o };
-    if let Ok(log_file) = log_opts.open("/tmp/pulse.log") {
+    if let Some(log_file) = open_log_file() {
         let sub = tracing_subscriber::fmt().with_writer(std::sync::Mutex::new(log_file)).with_ansi(false).finish();
         let _ = tracing::subscriber::set_global_default(sub);
     }
@@ -136,9 +88,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
+    // Install the panic hook BEFORE entering raw mode. Previously the hook was installed
+    // after `enable_raw_mode`, so any panic in between left the user with a broken terminal
+    // (no echo, no line discipline) and an orphaned alternate screen.
     std::panic::set_hook(Box::new(|info| {
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
-        let _ = ratatui::crossterm::ExecutableCommand::execute(&mut std::io::stdout(), ratatui::crossterm::terminal::LeaveAlternateScreen);
+        let _ = ratatui::crossterm::ExecutableCommand::execute(
+            &mut std::io::stdout(),
+            ratatui::crossterm::terminal::LeaveAlternateScreen,
+        );
         eprintln!("{}", info);
     }));
 
@@ -178,9 +136,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let target_contract = config.drop.target_contract.clone();
     let rpc_racer_clone = rpc_racer.clone();
 
-    // Pre-flight wallet balance check: balance >= value_wei + (gas_limit * max_fee_wei)
+    // Pre-flight wallet balance check: balance >= total mint value + (gas_limit * max_fee_wei)
     let max_fee_wei = pulse::gas::gwei_to_wei(effective_cap_gwei);
-    let mint_val_wei = config.drop.mint_value_wei.parse::<u128>().unwrap_or(0);
+    let unit_val_wei = config.drop.mint_value_wei.trim().parse::<u128>().unwrap_or(0);
+    let mint_val_wei = unit_val_wei.saturating_mul(config.drop.mint_quantity as u128);
     let needed_wei = mint_val_wei.saturating_add((config.gas.gas_limit as u128).saturating_mul(max_fee_wei));
     for w in &workers {
         if let Some(bal) = rpc_racer.fetch_balance(&w.address).await {
@@ -195,7 +154,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 🔥 WIRING UP ALL SNIPERS & ENGINES TO FIX DEAD ENDS 🔥
 
-    // 1. Exclusive Trigger Mode Spawning
+    // 1. Network/RPC Checks
+    //
+    // This runs BEFORE the trigger wiring below: the Mempool and StatePoller modes index
+    // `rpc_urls[0]`, so an empty RPC list used to panic here rather than report a clear error.
+    // WebSocket-only configs are also rejected, since RpcRacer marks them inactive and every
+    // dispatch would silently race zero endpoints.
+    let endpoints = rpc_racer.endpoints();
+    if !endpoints.iter().any(|ep| ep.is_healthy()) {
+        println!("❌ FATAL: No usable RPC endpoints found (empty list, or only WebSocket URLs). Please check config.toml.");
+        return Ok(());
+    }
+    state.add_log(format!("🌐 Active RPC Endpoints: {}", endpoints.iter().filter(|e| e.is_healthy()).count()));
+
+    // 2. Exclusive Trigger Mode Spawning
     match config.drop.trigger_mode {
         TriggerMode::Countdown => {
             let target_unix = config.drop.target_timestamp.unwrap_or(0);
@@ -209,22 +181,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
         TriggerMode::Mempool => {
-            let mempool_rpc = config.chain.ws_rpc_url.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(&config.chain.rpc_urls[0]);
-            let scanner = MempoolScanner::with_http_fallback(
-                mempool_rpc,
-                config.chain.rpc_urls.first().cloned(),
-                &target_contract,
-                config.drop.monitor_owner_address.clone(),
-                &config.drop.mempool_flip_signatures,
-            );
-            let tx_c = trigger_tx.clone();
-            tokio::spawn(async move { scanner.run_scan_loop(tx_c).await; });
-            let owner_info = config.drop.monitor_owner_address.as_deref().unwrap_or("any");
-            state.add_log(format!("🕵️ Armed Mempool Scanner for Owner {owner_info} on {mempool_rpc}"));
+            let mempool_rpc = config
+                .chain
+                .ws_rpc_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| config.chain.rpc_urls.first().map(String::as_str))
+                .unwrap_or_default();
+            if mempool_rpc.is_empty() {
+                state.add_log("⚠️ Mempool mode selected but no RPC/WebSocket URL is configured.".to_string());
+            } else {
+                let scanner = MempoolScanner::with_http_fallback(
+                    mempool_rpc,
+                    config.chain.rpc_urls.first().cloned(),
+                    &target_contract,
+                    config.drop.monitor_owner_address.clone(),
+                    &config.drop.mempool_flip_signatures,
+                );
+                let tx_c = trigger_tx.clone();
+                tokio::spawn(async move { scanner.run_scan_loop(tx_c).await; });
+                let owner_info = config.drop.monitor_owner_address.as_deref().unwrap_or("any");
+                state.add_log(format!("🕵️ Armed Mempool Scanner for Owner {owner_info} on {mempool_rpc}"));
+            }
         }
         TriggerMode::StatePoller => {
-            if !config.drop.flip_function_signatures.is_empty() && !config.chain.rpc_urls.is_empty() {
-                let poller = StatePoller::new(&config.chain.rpc_urls[0], &target_contract, &config.drop.flip_function_signatures);
+            if !config.drop.flip_function_signatures.is_empty() {
+                let rpc = config.chain.rpc_urls.first().cloned().unwrap_or_default();
+                let poller = StatePoller::new(&rpc, &target_contract, &config.drop.flip_function_signatures);
                 let tx_c = trigger_tx.clone();
                 tokio::spawn(async move { poller.run_poll_loop(tx_c).await; });
                 state.add_log("🔄 Armed On-Chain State Poller".to_string());
@@ -244,23 +227,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    // 3. Network/RPC Checks
-    let endpoints = rpc_racer.endpoints();
-    if endpoints.is_empty() {
-        println!("❌ FATAL: No valid RPC endpoints found. Please check config.toml.");
-        return Ok(());
-    }
-    state.add_log(format!("🌐 Active RPC Endpoints: {}", endpoints.len()));
-
     // 4. Advisory Pre-Flight Simulation (Ensures contract & calldata are valid at boot without deadlocking triggers)
+    // Simulate with the same total value the real dispatch will send, otherwise a
+    // quantity > 1 drop would simulate as a false `IncorrectPayment` revert.
     let sim_dest = config.drop.get_dispatch_destination(&target_contract);
-    let sim_calldata = config.drop.build_dispatch_calldata(Some(&workers[0].address), config.drop.mint_quantity);
-    if let (Ok(calldata), Ok(sim_val)) = (sim_calldata, config.drop.mint_value_wei.parse::<u128>()) {
+    let sim_calldata = pulse::eligibility::seadrop_calldata::encode_dispatch_calldata(
+        &config.drop,
+        &workers[0].address,
+        config.drop.mint_quantity,
+    );
+    let sim_val = pulse::eligibility::seadrop_calldata::total_dispatch_value_wei(
+        &config.drop,
+        config.drop.mint_quantity,
+    );
+    if let (Ok(calldata), Ok(sim_val)) = (sim_calldata, sim_val) {
         let simulator = RpcSimulator::new(&endpoints[0].url);
         match simulator.simulate_call(&workers[0].address, sim_dest, &calldata, sim_val, config.gas.gas_limit).await {
-            Ok(sim_res) if !sim_res.success => state.add_log(format!("⚠️ Advisory simulation reverted: {:?}", sim_res.revert_reason)),
-            Ok(sim_res) => state.add_log(format!("✅ Pre-flight simulation passed ({} gas)", sim_res.gas_used)),
-            Err(e) => state.add_log(format!("⚠️ Pre-flight simulation error: {e}")),
+            Ok(Some(sim_res)) if !sim_res.success => state.add_log(format!(
+                "⚠️ Advisory simulation reverted: {:?}. The drop will almost certainly fail on-chain.",
+                sim_res.revert_reason
+            )),
+            Ok(Some(sim_res)) => state.add_log(format!("✅ Pre-flight simulation passed ({} gas)", sim_res.gas_used)),
+            Ok(None) => state.add_log("⚠️ Pre-flight simulation produced no result.".to_string()),
+            // A transport failure is unknown, not a revert. Say so instead of implying the
+            // contract rejected the call.
+            Err(e) => state.add_log(format!(
+                "⚠️ Pre-flight simulation unavailable ({e}); on-chain outcome unknown."
+            )),
         }
     }
 
@@ -299,7 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    let mut has_fired = false;
+    let mut dispatch_state = DispatchState::Armed;
 
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
@@ -343,7 +336,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let msg = match &trigger {
                     SnipeTrigger::BaseFeeUpdated { base_fee_wei } => {
                         state.current_base_fee = wei_to_gwei(*base_fee_wei);
-                        if !has_fired {
+                        if dispatch_state != DispatchState::Fired {
                             match prepare_snipes(&workers, &config, &target_contract, *base_fee_wei, prev_base_fee_wei, &gas_engine) {
                                 Ok(snipes) => prepared_snipes = snipes,
                                 Err(e) => {
@@ -360,11 +353,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     SnipeTrigger::StateFlipDetected { new_state } => format!("🔥 Trigger: State flip to {}", new_state),
                 };
 
-                if has_fired {
-                    state.add_log(format!("ℹ️ Ignored secondary trigger: {}", msg));
-                    continue;
+                let decision = classify_trigger(dispatch_state, &trigger, !prepared_snipes.is_empty());
+                match decision {
+                    TriggerDecision::Telemetry => continue,
+                    TriggerDecision::Ignored => {
+                        state.add_log(format!("ℹ️ Ignored secondary trigger: {}", msg));
+                        continue;
+                    }
+                    TriggerDecision::AbortedEmpty => {
+                        // Abort BEFORE announcing, so a dispatch that never happened cannot be
+                        // reported as a fired snipe. `prepared_snipes` is rebuilt on the next
+                        // base-fee update, so staying armed is the correct transition.
+                        state.add_log(format!(
+                            "⛔ Snipe aborted: no prepared transactions (gas above ceiling or signing failed): {msg}"
+                        ));
+                        dispatch_state = apply_decision(dispatch_state, decision);
+                        continue;
+                    }
+                    TriggerDecision::Dispatch => {
+                        dispatch_state = apply_decision(dispatch_state, decision);
+                    }
                 }
-                has_fired = true;
+
                 if headless { println!("{msg}"); }
                 state.add_log(msg.clone());
 
@@ -374,35 +384,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     alerts_c.dispatch_alert("🚨 Snipe Trigger Fired", &desc, true).await;
                 });
 
-                if prepared_snipes.is_empty() {
-                    state.add_log("⛔ Snipe aborted: current gas fee exceeds ceiling or no transactions prepared.".to_string());
-                    has_fired = false;
-                    continue;
-                }
-
-                // Atomic MEV Bundles (DEF-03): When multiple wallets on L1, dispatch batch as bundle
+                // Atomic MEV Bundles: when multiple wallets on L1, dispatch the batch as a single
+                // bundle so the wallets cannot sandwich each other.
+                //
+                // If every builder rejects the bundle, nothing has reached the network yet, so the
+                // pre-signed transactions must still be broadcast or the whole drop is silently lost.
                 let is_bundle = is_l1 && mev_client.is_some() && prepared_snipes.len() > 1;
                 if is_bundle {
                     let mev = mev_client.as_ref().unwrap().clone();
                     let raw_txs: Vec<String> = prepared_snipes.iter().map(|p| p.raw_tx.clone()).collect();
                     let racer_target = rpc_racer_clone.clone();
                     let alerts_c = alerts.clone();
+                    let allow_fallback = config.gas.allow_public_fallback;
                     tokio::spawn(async move {
                         let target_block = racer_target.fetch_latest_block_number().await.unwrap_or(0) + 1;
                         let outcomes = mev.send_bundle(&raw_txs, target_block).await;
-                        let success = outcomes.iter().any(|o| o.success);
-                        alerts_c.dispatch_alert(
-                            if success { "📦 MEV Bundle Included" } else { "⚠️ MEV Bundle Rejected" },
-                            &format!("Block: {target_block}\nOutcomes: {outcomes:?}"),
-                            success,
-                        ).await;
+                        let accepted = outcomes.iter().any(|o| o.success);
+
+                        if accepted {
+                            alerts_c.dispatch_alert("📦 MEV Bundle Submitted", &format!("Block: {target_block}\nOutcomes: {outcomes:?}"), true).await;
+                            return;
+                        }
+
+                        // No builder accepted the bundle: the transactions are still unsent.
+                        if allow_fallback {
+                            alerts_c.dispatch_alert("⚠️ All Builders Rejected Bundle, broadcasting to public RPC", &format!("Block: {target_block}\nOutcomes: {outcomes:?}"), false).await;
+                            for raw in &raw_txs {
+                                let _ = racer_target.race_broadcast_raw_tx(raw).await;
+                            }
+                        } else {
+                            alerts_c.dispatch_alert("⚠️ All Builders Rejected Bundle (public fallback disabled to prevent sandwiching)", &format!("Block: {target_block}\nOutcomes: {outcomes:?}"), false).await;
+                        }
                     });
                 }
 
                 // ZERO-LATENCY DISPATCH: blast pre-signed transactions immediately!
                 for prepared in &prepared_snipes {
                     state.add_log(format!("🚀 Blasting pre-signed tx for {} (Nonce: {}, Hash: {})", prepared.worker.address, prepared.nonce, prepared.tx_hash));
-                    prepared.worker.nonce_mgr.set_nonce(prepared.nonce + 1);
+                    // Monotonic: never rewind a nonce that a concurrent observer already advanced.
+                    prepared.worker.nonce_mgr.advance(prepared.nonce + 1);
 
                     let submitted = SubmittedTx {
                         worker: prepared.worker.clone(),
@@ -417,57 +437,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     };
 
                     let alerts_c = alerts.clone();
-                    let addr = prepared.worker.address.clone();
-                    let h = prepared.tx_hash.clone();
-                    let nonce = prepared.nonce;
+                    let (addr, h, nonce) = (prepared.worker.address.clone(), prepared.tx_hash.clone(), prepared.nonce);
                     tokio::spawn(async move {
-                        alerts_c.dispatch_alert("🚀 Mint Tx Broadcast", &format!("Wallet: {}\nNonce: {}\nTx: {}", addr, nonce, h), true).await;
+                        alerts_c.dispatch_alert("🚀 Mint Tx Broadcast", &format!("Wallet: {addr}\nNonce: {nonce}\nTx: {h}"), true).await;
                     });
 
                     // MEV Private Relay on L1 (Never leak to public mempool at T+0; fallback only if rejected)
                     if !is_bundle {
                         if let Some(mev) = &mev_client {
-                            let mev_clone = mev.clone();
-                            let tx_clone = prepared.raw_tx.clone();
-                            let alerts_c = alerts.clone();
-                            let racer_fallback = rpc_racer_clone.clone();
-                            let allow_fallback = config.gas.allow_public_fallback;
+                            let (mev_c, tx_c, alerts_c, racer_fb, allow_fb) = (mev.clone(), prepared.raw_tx.clone(), alerts.clone(), rpc_racer_clone.clone(), config.gas.allow_public_fallback);
                             tokio::spawn(async move {
-                                let outcomes = mev_clone.send_private_transaction(&tx_clone).await;
+                                let outcomes = mev_c.send_private_transaction(&tx_c).await;
                                 if !outcomes.iter().any(|o| o.success) {
-                                    if allow_fallback {
+                                    if allow_fb {
                                         alerts_c.dispatch_alert("⚠️ All Builders Rejected, falling back to public RPC", &format!("{outcomes:?}"), false).await;
-                                        let _ = racer_fallback.race_broadcast_raw_tx(&tx_clone).await;
+                                        let _ = racer_fb.race_broadcast_raw_tx(&tx_c).await;
                                     } else {
                                         alerts_c.dispatch_alert("⚠️ All Builders Rejected (public fallback disabled to prevent sandwiching)", &format!("{outcomes:?}"), false).await;
                                     }
                                 }
                             });
                         } else {
-                            // On L2 or without builders: race public RPC endpoints
-                            let racer = rpc_racer_clone.clone();
-                            let raw_tx_clone = prepared.raw_tx.clone();
-                            tokio::spawn(async move {
-                                let _outcomes = racer.race_broadcast_raw_tx(&raw_tx_clone).await;
-                            });
+                            let (racer, raw_tx) = (rpc_racer_clone.clone(), prepared.raw_tx.clone());
+                            tokio::spawn(async move { let _ = racer.race_broadcast_raw_tx(&raw_tx).await; });
                         }
                     }
 
-                    // Background monitor for receipt & auto-speedup (routes replacement to correct destination)
+                    // Background monitor for receipt & auto-speedup
                     let destination = config.drop.get_dispatch_destination(&target_contract);
                     spawn_tx_monitor(
-                        submitted,
-                        rpc_racer_clone.clone(),
-                        mev_client.clone(),
-                        alerts.clone(),
-                        gas_engine.clone(),
-                        config.chain.chain_id,
-                        destination.to_string(),
-                        config.gas.auto_speedup,
-                        config.gas.speedup_threshold_ms,
-                        config.gas.gas_limit,
-                        config.gas.allow_public_fallback,
-                        ui_log_tx.clone(),
+                        submitted, rpc_racer_clone.clone(), mev_client.clone(), alerts.clone(), gas_engine.clone(),
+                        config.chain.chain_id, destination.to_string(), config.gas.auto_speedup,
+                        config.gas.speedup_threshold_ms, config.gas.gas_limit, config.gas.allow_public_fallback, ui_log_tx.clone(),
                     );
                 }
             }

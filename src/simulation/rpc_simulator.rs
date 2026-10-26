@@ -29,6 +29,11 @@ impl RpcSimulator {
     }
 
     /// Simulates transaction execution via remote RPC `eth_estimateGas` to detect honeypots/reverts.
+    /// Distinguishes "the call reverts" from "we could not find out".
+    ///
+    /// Returns `Ok(Some(gas))` on success, `Ok(None)` when the node answered and the call
+    /// reverted, and `Err` when the simulation itself failed. Callers must not treat `Err`
+    /// as a revert: a 429 or a timeout from a public RPC says nothing about the contract.
     pub async fn simulate_call(
         &self,
         caller: &str,
@@ -36,7 +41,7 @@ impl RpcSimulator {
         calldata: &[u8],
         value_wei: u128,
         gas_limit: u64,
-    ) -> Result<SimResult, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<SimResult>, Box<dyn std::error::Error + Send + Sync>> {
         let mut tx_obj = json!({
             "from": caller,
             "to": target_contract,
@@ -54,15 +59,30 @@ impl RpcSimulator {
         });
 
         let resp = self.client.post(&self.rpc_url).json(&payload).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!(
+                "simulation endpoint returned HTTP {status} (not a contract revert)"
+            )
+            .into());
+        }
         let body: Value = resp.json().await?;
 
         if let Some(err) = body.get("error") {
             let revert_reason = err.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown revert");
-            return Ok(SimResult {
+            // A JSON-RPC transport-level failure (rate limit, node overload) carries an
+            // error object but is not an execution result.
+            if let Some(code) = err.get("code").and_then(|c| c.as_i64()) {
+                let node_level = matches!(code, -32005 | -32603 | -32000);
+                if node_level && err.get("data").is_none() {
+                    return Err(format!("simulation failed at the node (code {code}): {revert_reason}").into());
+                }
+            }
+            return Ok(Some(SimResult {
                 success: false,
                 gas_used: 0,
                 revert_reason: Some(revert_reason.to_string()),
-            });
+            }));
         }
 
         let res = body
@@ -71,10 +91,10 @@ impl RpcSimulator {
             .ok_or("eth_estimateGas returned no result")?;
         let gas_used = u64::from_str_radix(res.trim_start_matches("0x"), 16)?;
 
-        Ok(SimResult {
+        Ok(Some(SimResult {
             success: true,
             gas_used,
             revert_reason: None,
-        })
+        }))
     }
 }

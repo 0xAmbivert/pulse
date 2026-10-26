@@ -9,3 +9,8 @@ SECURITY_AUDIT_REPORT.md
 PULSE_AUDIT_AND_HANDOFF.md
 *handoff*
 handoff.md
+*review*
+*REVIEW*
+*.patch
+.zwork/
+patches/
