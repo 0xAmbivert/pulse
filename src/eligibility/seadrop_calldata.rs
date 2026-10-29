@@ -129,9 +129,9 @@ pub fn encode_mint_allow_list(
     };
     let start_time = config.target_timestamp.unwrap_or(0);
     let end_time = config.allowlist_end_time.unwrap_or(u64::MAX);
-    let stage_index = config.allowlist_stage_index.ok_or_else(|| {
-        "SeaDrop allowlist minting requires allowlist_stage_index (must be non-zero)".to_string()
-    })?;
+    // Default to stage 1 when not explicitly specified, since OpenSea/SeaDrop uses
+    // dropStageIndex = 1 for the primary allowlist stage. Explicit 0 is rejected.
+    let stage_index = config.allowlist_stage_index.unwrap_or(1);
     if stage_index == 0 {
         return Err(
             "SeaDrop rejects dropStageIndex 0 for allowlist stages (must be non-zero)".to_string(),
@@ -271,6 +271,12 @@ mod tests {
         let mut cfg = allowlist_config();
         cfg.allowlist_stage_index = Some(0);
         assert!(encode_mint_allow_list(&cfg, "0x1111111111111111111111111111111111111111", 1).is_err());
+
+        // When None (unspecified in CLI menu or config), defaults to stage 1.
+        let mut cfg_default_stage = allowlist_config();
+        cfg_default_stage.allowlist_stage_index = None;
+        let encoded = encode_mint_allow_list(&cfg_default_stage, "0x1111111111111111111111111111111111111111", 1).unwrap();
+        assert_eq!(word(&encoded, 8), 1, "unspecified stage index must default to 1");
 
         let mut cfg = allowlist_config();
         cfg.merkle_proof = vec!["0xdeadbeef".to_string()];

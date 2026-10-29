@@ -120,7 +120,7 @@ pub fn spawn_tx_monitor(
 
                 match gas_engine.calculate_speedup_fees(tx.max_fee_wei, tx.priority_fee_wei) {
                     Ok((new_max, new_prio)) => {
-                        match tx.worker.build_and_sign_eip1559(
+                        match tx.worker.build_and_sign_eip1559_with_hash(
                             chain_id,
                             &destination_contract,
                             &tx.calldata,
@@ -130,16 +130,7 @@ pub fn spawn_tx_monitor(
                             new_prio,
                             Some(tx.nonce),
                         ) {
-                            Ok((new_raw, _)) => {
-                                let new_bytes = match hex::decode(new_raw.trim_start_matches("0x")) {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        let _ = ui_log_tx.send(format!("⚠️ Speedup produced invalid hex: {e}")).await;
-                                        continue;
-                                    }
-                                };
-                                let new_hash =
-                                    format!("{:#x}", alloy::primitives::keccak256(&new_bytes));
+                            Ok((new_raw, new_hash, _)) => {
                                 tx.tx_hashes.push(new_hash.clone());
                                 tx.max_fee_wei = new_max;
                                 tx.priority_fee_wei = new_prio;

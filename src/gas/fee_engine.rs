@@ -19,9 +19,12 @@ pub struct GasEngine {
 
 impl GasEngine {
     pub fn new(max_fee_ceiling_gwei: f64, default_priority_fee_gwei: f64, bump_percent: u32) -> Self {
+        let max_fee_ceiling_wei = gwei_to_wei(max_fee_ceiling_gwei);
+        // Priority fee must never exceed max fee ceiling (EIP-1559 ErrTipAboveFeeCap protection).
+        let default_priority_fee_wei = gwei_to_wei(default_priority_fee_gwei).min(max_fee_ceiling_wei);
         Self {
-            max_fee_ceiling_wei: gwei_to_wei(max_fee_ceiling_gwei),
-            default_priority_fee_wei: gwei_to_wei(default_priority_fee_gwei),
+            max_fee_ceiling_wei,
+            default_priority_fee_wei,
             bump_percent: bump_percent.max(12), // Minimum 12% to guarantee EVM replacement acceptance
         }
     }
@@ -35,7 +38,8 @@ impl GasEngine {
     ) -> Result<(u128, u128), GasError> {
         let priority_fee = custom_priority_gwei
             .map(gwei_to_wei)
-            .unwrap_or(self.default_priority_fee_wei);
+            .unwrap_or(self.default_priority_fee_wei)
+            .min(self.max_fee_ceiling_wei);
 
         let max_fee = current_base_fee_wei
             .checked_mul(2)
@@ -99,7 +103,8 @@ impl GasEngine {
         let new_priority_fee = prev_priority_fee_wei
             .checked_mul(multiplier)
             .map(|v| v.div_ceil(100)) // round up
-            .ok_or(GasError::Overflow)?;
+            .ok_or(GasError::Overflow)?
+            .min(new_max_fee);
 
         if new_max_fee > self.max_fee_ceiling_wei {
             return Err(GasError::ExceedsCeiling {
@@ -113,6 +118,9 @@ impl GasEngine {
 }
 
 pub fn gwei_to_wei(gwei: f64) -> u128 {
+    if !gwei.is_finite() || gwei <= 0.0 {
+        return 0;
+    }
     (gwei * 1_000_000_000.0).round() as u128
 }
 
@@ -139,6 +147,16 @@ mod tests {
         let engine = GasEngine::new(25.0, 2.0, 15);
         let res = engine.calculate_speedup_fees(24_000_000_000, 2_000_000_000);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_priority_fee_never_exceeds_max_fee() {
+        // Low-gas L2 scenario: user sets max_fee_gwei = 0.2 while default_priority_fee = 1.0
+        let engine = GasEngine::new(0.2, 1.0, 15);
+        let (max_fee, prio_fee) = engine.calculate_dynamic_fees(0, None).unwrap();
+        assert!(prio_fee <= max_fee, "priority fee must never exceed max fee");
+        assert_eq!(max_fee, 200_000_000);
+        assert_eq!(prio_fee, 200_000_000);
     }
 
     #[test]

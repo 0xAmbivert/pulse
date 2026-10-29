@@ -46,7 +46,7 @@
 | **No Keystore Files** | Keys are never written to disk | Read into dedicated `mmap` page, `mlock`ed (fail-closed), `MADV_DONTDUMP`, and zeroized on drop; zero disk residue |
 | **Multi-Wallet Concurrency** | Blast parallel nonces simultaneously | Supports comma-separated keys in RAM wizard; initializes isolated `WalletWorker`s to dominate block space |
 | **OpenSea SIWE (EIP-4361)** | Zero-browser automated drop auth | Bot requests challenge, signs EIP-191 locally in RAM, obtains JWT, and pulls private Merkle proofs automatically |
-| **Allowlist & Merkle Proofs** | Seamless presale & whitelist execution | Native dynamic `bytes32[]` ABI encoding and direct SeaDrop `mintAllowList` (`0x7b233a75`) protocol routing |
+| **Allowlist & Merkle Proofs** | Seamless presale & whitelist execution | Native dynamic `bytes32[]` ABI encoding and direct SeaDrop `mintAllowList` (`0x4300a4e6`) protocol routing |
 | **Zero Web Dependencies** | Immune to OpenSea / MintGo website crashes | Mint transactions route directly to on-chain smart contracts via private RPC/MEV sockets |
 | **Sub-Millisecond Dispatch** | Zero work on the trigger hit path | EIP-1559 transactions are pre-constructed and pre-signed in memory; trigger bursts pre-signed bytes instantly |
 | **Chain-Aware Relaying** | L1 private MEV first; L2 parallel RPC racer | On L1, builders (Flashbots, Titan, Beaver) are tried first; on L2, parallel RPC racers flood sequencers |
@@ -133,8 +133,8 @@ Automatically constructs exact EVM calldata with 32-byte head offset pointers, 3
 
 ### 2. Native SeaDrop v1.0 `mintAllowList` Routing
 When sniping SeaDrop drops with active allowlist stages, Pulse routes transactions to:
-`mintAllowList(address,address,address,(uint256,uint256,uint256,uint256,uint256,uint256,uint16,bool),bytes32[])` (selector `0x7b233a75`).
-It ABI-packs the 8-word `AllowListData` tuple and appends dynamic Merkle proofs without requiring web frontend interaction.
+`mintAllowList(address,address,address,uint256,(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),bytes32[])` (selector `0x4300a4e6`).
+It ABI-packs the top-level `quantity` and 8-word `MintParams` tuple and appends dynamic Merkle proofs without requiring web frontend interaction.
 
 ---
 
@@ -334,7 +334,7 @@ telegram_bot_token = ""
 telegram_chat_id = ""
 ```
 
-> 💡 **Webhook Secrets via Environment Variables**: You can supply `DISCORD_WEBHOOK`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` as environment variables instead of writing them to `config.toml`. All internal logs are written to `/tmp/pulse.log` so secrets are never printed to the TUI.
+> 💡 **Webhook Secrets via Environment Variables**: You can supply `DISCORD_WEBHOOK`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` as environment variables instead of writing them to `config.toml`. All internal logs are written to `$XDG_STATE_HOME/pulse/pulse.log` (mode `0600`, `O_NOFOLLOW`) so secrets are never printed to the TUI.
 
 ---
 

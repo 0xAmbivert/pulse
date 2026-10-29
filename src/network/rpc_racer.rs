@@ -1,7 +1,11 @@
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+fn is_ws_url(url: &str) -> bool {
+    url.starts_with("ws://") || url.starts_with("wss://")
+}
 
 /// One RPC endpoint plus its live health flag.
 ///
@@ -58,6 +62,7 @@ pub struct BroadcastOutcome {
 pub struct RpcRacer {
     client: Client,
     endpoints: Vec<RpcEndpoint>,
+    cached_block_number: AtomicU64,
 }
 
 impl RpcRacer {
@@ -73,7 +78,7 @@ impl RpcRacer {
         let endpoints = urls
             .iter()
             .map(|url| {
-                let is_ws = url.starts_with("ws://") || url.starts_with("wss://");
+                let is_ws = is_ws_url(url);
                 if is_ws {
                     eprintln!("⚠️ WARNING: WebSocket URL detected: {}. RpcRacer requires HTTP/HTTPS endpoints. Marking inactive.", url);
                 }
@@ -84,17 +89,43 @@ impl RpcRacer {
         Self {
             client,
             endpoints,
+            cached_block_number: AtomicU64::new(0),
         }
     }
 
-    /// Pings all configured RPC endpoints concurrently to evaluate response times and keep connection pools warm.
+    /// Returns healthy HTTP endpoints, or falls back to all non-WebSocket endpoints
+    /// if every endpoint was temporarily demoted (fail-open under transient blips).
+    fn active_endpoints(&self) -> Vec<&RpcEndpoint> {
+        let healthy: Vec<&RpcEndpoint> = self
+            .endpoints
+            .iter()
+            .filter(|ep| ep.is_healthy() && !is_ws_url(&ep.url))
+            .collect();
+        if !healthy.is_empty() {
+            return healthy;
+        }
+        self.endpoints
+            .iter()
+            .filter(|ep| !is_ws_url(&ep.url))
+            .collect()
+    }
+
+    /// Returns the most recently observed block number from health probes or block queries.
+    pub fn cached_block_number(&self) -> u64 {
+        self.cached_block_number.load(Ordering::Relaxed)
+    }
+
+    /// Pings all configured HTTP RPC endpoints concurrently to evaluate response times and keep connection pools warm.
     ///
-    /// This doubles as the health probe: endpoints that fail are demoted, and previously
-    /// demoted endpoints are re-probed so a transient outage cannot disable one permanently.
+    /// This doubles as the health probe: endpoints that fail or return JSON-RPC errors are demoted,
+    /// and previously demoted HTTP endpoints are re-probed so a transient outage cannot disable one permanently.
     pub async fn benchmark_latencies(&self) -> Vec<(String, Option<u64>)> {
         let mut tasks = Vec::new();
 
         for endpoint in &self.endpoints {
+            if is_ws_url(&endpoint.url) {
+                continue;
+            }
             let client = self.client.clone();
             let url = endpoint.url.clone();
             tasks.push(tokio::spawn(async move {
@@ -109,16 +140,25 @@ impl RpcRacer {
                 match client.post(&url).json(&payload).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         let elapsed = start.elapsed().as_millis() as u64;
-                        (url, Some(elapsed))
+                        if let Ok(body) = resp.json::<Value>().await {
+                            if let Some(hex_str) = body.get("result").and_then(|r| r.as_str()) {
+                                let blk = u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok();
+                                return (url, Some(elapsed), blk);
+                            }
+                        }
+                        (url, None, None)
                     }
-                    _ => (url, None),
+                    _ => (url, None, None),
                 }
             }));
         }
 
         let mut results = Vec::new();
         for task in tasks {
-            if let Ok((url, latency)) = task.await {
+            if let Ok((url, latency, maybe_blk)) = task.await {
+                if let Some(blk) = maybe_blk {
+                    self.cached_block_number.fetch_max(blk, Ordering::Relaxed);
+                }
                 self.mark_health(&url, latency.is_some());
                 results.push((url, latency));
             }
@@ -148,10 +188,7 @@ impl RpcRacer {
 
         let mut handles = Vec::new();
 
-        for ep in &self.endpoints {
-            if !ep.is_healthy() {
-                continue;
-            }
+        for ep in self.active_endpoints() {
             let client = self.client.clone();
             let url = ep.url.clone();
             let tx_data = raw_hex.clone();
@@ -244,6 +281,7 @@ impl RpcRacer {
 
         let mut handles = Vec::new();
         let mut tasks = FuturesUnordered::new();
+        let active = self.active_endpoints();
         for hash in tx_hashes {
             let payload = json!({
                 "jsonrpc": "2.0",
@@ -251,10 +289,7 @@ impl RpcRacer {
                 "params": [hash],
                 "id": 1
             });
-            for ep in &self.endpoints {
-                if !ep.is_healthy() {
-                    continue;
-                }
+            for ep in &active {
                 let client = self.client.clone();
                 let url = ep.url.clone();
                 let p = payload.clone();
@@ -305,10 +340,7 @@ impl RpcRacer {
         let mut handles = Vec::new();
         let mut tasks = FuturesUnordered::new();
 
-        for ep in &self.endpoints {
-            if !ep.is_healthy() {
-                continue;
-            }
+        for ep in self.active_endpoints() {
             let client = self.client.clone();
             let url = ep.url.clone();
             let p = payload.clone();
@@ -360,15 +392,28 @@ impl RpcRacer {
     /// Queries the latest confirmed block number across endpoints in parallel.
     pub async fn fetch_latest_block_number(&self) -> Option<u64> {
         let payload = json!({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1});
+        let blk = self.race_query(payload, |r| {
+            let hex_str = r.as_str()?;
+            u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok()
+        }).await;
+        if let Some(b) = blk {
+            self.cached_block_number.fetch_max(b, Ordering::Relaxed);
+        }
+        blk
+    }
+
+    /// Queries the on-chain confirmed transaction count (nonce) for an address in parallel.
+    pub async fn fetch_transaction_count(&self, address: &str) -> Option<u64> {
+        let payload = json!({"jsonrpc": "2.0", "method": "eth_getTransactionCount", "params": [address, "latest"], "id": 1});
         self.race_query(payload, |r| {
             let hex_str = r.as_str()?;
             u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok()
         }).await
     }
 
-    /// Queries the on-chain confirmed transaction count (nonce) for an address in parallel.
-    pub async fn fetch_transaction_count(&self, address: &str) -> Option<u64> {
-        let payload = json!({"jsonrpc": "2.0", "method": "eth_getTransactionCount", "params": [address, "latest"], "id": 1});
+    /// Queries the pending transaction count (nonce) for an address across endpoints in parallel.
+    pub async fn fetch_pending_transaction_count(&self, address: &str) -> Option<u64> {
+        let payload = json!({"jsonrpc": "2.0", "method": "eth_getTransactionCount", "params": [address, "pending"], "id": 1});
         self.race_query(payload, |r| {
             let hex_str = r.as_str()?;
             u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).ok()
@@ -480,5 +525,22 @@ mod tests {
         let eps = racer.endpoints();
         assert!(!eps[0].is_healthy(), "ws endpoint must be inactive");
         assert!(eps[1].is_healthy(), "http endpoint must be active");
+    }
+
+    #[test]
+    fn active_endpoints_fails_open_when_all_http_demoted() {
+        let racer = RpcRacer::new(
+            &[
+                "wss://ws.example".to_string(),
+                "https://http1.example".to_string(),
+                "https://http2.example".to_string(),
+            ],
+            1000,
+        );
+        racer.mark_health("https://http1.example", false);
+        racer.mark_health("https://http2.example", false);
+        let active = racer.active_endpoints();
+        assert_eq!(active.len(), 2, "must fail open to non-WS endpoints when all are demoted");
+        assert!(active.iter().all(|ep| ep.url.starts_with("https://")));
     }
 }

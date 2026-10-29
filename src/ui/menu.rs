@@ -323,6 +323,9 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                 session_config.drop.merkle_proof = merkle_proof;
                 session_config.drop.target_timestamp = target_timestamp;
                 session_config.drop.monitor_owner_address = monitor_owner_address;
+                if seadrop_contract.is_some() && !session_config.drop.merkle_proof.is_empty() {
+                    session_config.drop.allowlist_stage_index = session_config.drop.allowlist_stage_index.or(Some(1));
+                }
                 session_config.drop.seadrop_contract = seadrop_contract;
                 session_config.drop.seadrop_fee_recipient = seadrop_fee;
                 session_config.gas.max_fee_gwei = max_gas_fee;
@@ -470,10 +473,13 @@ pub async fn run_interactive_menu(base_config: &AppConfig) -> Result<MenuAction,
                                 session_config.drop.seadrop_fee_recipient = report.seadrop_config.as_ref().and_then(|s| s.fee_recipient.clone())
                                     .or(report.target.fee_recipient.clone());
                                 if !session_config.drop.merkle_proof.is_empty() {
-                                    session_config.drop.mint_function = "mintAllowList(address,address,address,(uint256,uint256,uint256,uint256,uint256,uint256,uint16,bool),bytes32[])".to_string();
+                                    session_config.drop.allowlist_stage_index = session_config.drop.allowlist_stage_index.or(Some(1));
+                                    session_config.drop.mint_function = "mintAllowList(address,address,address,uint256,(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),bytes32[])".to_string();
                                 } else {
                                     session_config.drop.mint_function = "mintPublic(address,address,address,uint256)".to_string();
                                 }
+                            } else if let Some(ref detected_fn) = report.wallet_status.detected_mint_function {
+                                session_config.drop.mint_function = detected_fn.clone();
                             }
 
                             println!("\n🚀 Loading verified drop into sniper. Booting engine...");

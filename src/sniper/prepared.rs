@@ -43,7 +43,7 @@ pub fn prepare_snipes(
             config.drop.mint_quantity,
         )?;
         let nonce = worker.nonce_mgr.current();
-        let (raw_tx, n) = worker.build_and_sign_eip1559(
+        let (raw_tx, tx_hash, n) = worker.build_and_sign_eip1559_with_hash(
             config.chain.chain_id,
             destination,
             &calldata,
@@ -53,9 +53,6 @@ pub fn prepare_snipes(
             max_prio_wei,
             Some(nonce),
         )?;
-        let tx_bytes = hex::decode(raw_tx.trim_start_matches("0x"))
-            .map_err(|e| format!("Signed transaction is not valid hex: {e}"))?;
-        let tx_hash = format!("{:#x}", alloy::primitives::keccak256(&tx_bytes));
         snipes.push(PreparedSnipe {
             worker: worker.clone(),
             raw_tx,

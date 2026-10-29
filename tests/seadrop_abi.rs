@@ -52,7 +52,8 @@ fn legacy_bogus_allowlist_selector_is_rejected() {
 ///
 /// `mintAllowList(address,address,address,uint256,MintParams,bytes32[])` has 12 static
 /// words (nftContract, feeRecipient, minterIfNotPayer, quantity, then the 8 inlined
-/// `MintParams` words), so the `bytes32[] proof` offset must be `12 * 32 == 384`.
+/// `MintParams` words) plus 1 offset word for `bytes32[] proof` in the head section,
+/// so the `bytes32[] proof` tail begins at `(12 + 1) * 32 == 416` (`0x1a0`).
 /// `quantity` is a top-level argument and must precede the tuple.
 #[test]
 fn expected_allowlist_word_layout() {
@@ -70,11 +71,11 @@ fn expected_allowlist_word_layout() {
         "maxTokenSupplyForStage",
         "feeBps",
         "restrictFeeRecipients",
-        "proofOffset", // == 384
+        "proofOffset", // == 416 (13 head words * 32 bytes)
         "proofLength",
         // proof elements follow
     ];
     assert_eq!(layout.len(), 14);
-    let proof_offset = (layout.len() - 2) * 32;
-    assert_eq!(proof_offset, 384, "proof offset is 12 static words");
+    let proof_offset = (layout.len() - 1) * 32;
+    assert_eq!(proof_offset, 416, "proof offset is 13 head words (416 bytes)");
 }

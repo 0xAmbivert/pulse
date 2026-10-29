@@ -97,40 +97,49 @@ impl EligibilityChecker {
             None
         };
 
-        let wallet_state_known = onchain_stats.is_some() || seadrop_public.is_some() || opensea_eligibility.is_some();
+        let wallet_state_known = onchain_stats.is_some()
+            || seadrop_public.is_some()
+            || opensea_eligibility.is_some()
+            || onchain_total.is_some()
+            || onchain_max.is_some()
+            || !stages.is_empty();
         let minted_by_wallet = onchain_stats.map(|(w, _, _)| w).unwrap_or(0);
         let max_per_wallet = seadrop_public
             .as_ref()
             .map(|sd| sd.max_per_wallet)
+            .or_else(|| opensea_eligibility.as_ref().and_then(|oe| oe.max_mintable))
             .or_else(|| stages.iter().find(|s| s.is_active_now).and_then(|s| s.max_per_wallet))
             .or_else(|| stages.first().and_then(|s| s.max_per_wallet))
             .unwrap_or(0);
         let price_wei = seadrop_public.as_ref().map(|sd| sd.mint_price_wei)
+            .or_else(|| opensea_eligibility.as_ref().and_then(|oe| oe.price_wei))
             .or_else(|| stages.iter().find(|s| s.is_active_now).map(|s| s.price_wei))
             .unwrap_or(0);
         let price_eth = price_wei as f64 / 1e18;
 
-        let remaining = if is_sold_out || !wallet_state_known {
-            0
-        } else if max_per_wallet == 0 {
-            max_supply.map_or(u64::MAX, |m| m.saturating_sub(minted_supply))
-        } else {
-            max_per_wallet.saturating_sub(minted_by_wallet)
+        let compute_remaining = |known_or_eligible: bool| -> u64 {
+            if is_sold_out || !known_or_eligible {
+                0
+            } else if max_per_wallet == 0 {
+                max_supply.map_or(u64::MAX, |m| m.saturating_sub(minted_supply))
+            } else {
+                max_per_wallet.saturating_sub(minted_by_wallet)
+            }
         };
 
+        let mut remaining = compute_remaining(wallet_state_known);
+
         // 5. On-Chain Simulation Verification
-        let (is_eligible, status_reason, simulated_gas) = if is_sold_out {
-            (false, "Collection is 100% Sold Out".to_string(), None)
-        } else if seadrop_public.is_none() && !wallet_state_known && stages.is_empty() && intel_minted.is_none() {
-            (false, "Eligibility unknown: no on-chain or MintGo data".to_string(), None)
+        let (is_eligible, status_reason, simulated_gas, detected_mint_function) = if is_sold_out {
+            (false, "Collection is 100% Sold Out".to_string(), None, None)
         } else if let Some(ref sd) = seadrop_public {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             if now < sd.start_time {
-                (false, format!("Public Drop is Not Active Yet (Starts in {} minutes)", (sd.start_time - now) / 60), None)
+                (false, format!("Public Drop is Not Active Yet (Starts in {} minutes)", (sd.start_time - now) / 60), None, Some("mintPublic(address,address,address,uint256)".to_string()))
             } else if now > sd.end_time {
-                (false, "Public Drop has Expired".to_string(), None)
+                (false, "Public Drop has Expired".to_string(), None, None)
             } else if remaining == 0 {
-                (false, format!("Wallet Reached Limit ({minted_by_wallet}/{max_per_wallet})"), None)
+                (false, format!("Wallet Reached Limit ({minted_by_wallet}/{max_per_wallet})"), None, None)
             } else {
                 // Simulate SeaDrop mintPublic on-chain
                 let clean_nft = target.contract_address.trim_start_matches("0x").to_lowercase();
@@ -147,27 +156,27 @@ impl EligibilityChecker {
                 let val_hex = format!("0x{:x}", sd.mint_price_wei);
 
                 match seadrop_inspector.simulate_mint(wallet_address, SEADROP_V1_ADDRESS, &calldata, &val_hex).await {
-                    Ok(gas) => (true, "Eligible to Mint Public Drop".to_string(), Some(gas)),
-                    Err(revert_msg) => (false, format!("Simulation Reverted: {revert_msg}"), None),
+                    Ok(gas) => (true, "Eligible to Mint Public Drop".to_string(), Some(gas), Some("mintPublic(address,address,address,uint256)".to_string())),
+                    Err(revert_msg) => (false, format!("Simulation Reverted: {revert_msg}"), None, Some("mintPublic(address,address,address,uint256)".to_string())),
                 }
             }
         } else {
-            // General NFT contract simulation: test standard function selectors
+            // General NFT contract simulation: test standard function selectors on-chain
             let val_hex = format!("0x{:x}", price_wei);
             let candidates = [
-                format!("0xa0712d68{:0>64}", "1"), // mint(uint256)
-                "0x1249c58b".to_string(),          // mint()
-                "0x4e71d92d".to_string(),          // claim()
-                "0xa6f2ae3a".to_string(),          // publicMint()
+                ("mint(uint256)", format!("0xa0712d68{:0>64}", "1")),
+                ("mint()", "0x1249c58b".to_string()),
+                ("claim()", "0x4e71d92d".to_string()),
+                ("publicMint()", "0xa6f2ae3a".to_string()),
             ];
 
             let mut sim_success = None;
             let mut last_revert = String::new();
 
-            for calldata in &candidates {
+            for (sig, calldata) in &candidates {
                 match seadrop_inspector.simulate_mint(wallet_address, &target.contract_address, calldata, &val_hex).await {
                     Ok(gas) => {
-                        sim_success = Some(gas);
+                        sim_success = Some((gas, (*sig).to_string()));
                         break;
                     }
                     Err(e) => {
@@ -177,19 +186,25 @@ impl EligibilityChecker {
             }
 
             match sim_success {
-                Some(gas) => (true, "Eligible to Mint via Direct Contract".to_string(), Some(gas)),
+                Some((gas, sig)) => {
+                    remaining = compute_remaining(true);
+                    (true, "Eligible to Mint via Direct Contract".to_string(), Some(gas), Some(sig))
+                }
                 None => {
                     // Check MintGo live mint-tx endpoint as secondary signal
                     if let Ok(tx_val) = self.mintgo.check_mint_tx(&target.chain, &target.contract_address, wallet_address, 1).await {
                         if let Some(err) = tx_val.get("error").and_then(|e| e.as_str()) {
-                            (false, format!("MintGo Guard: {err}"), None)
+                            (false, format!("MintGo Guard: {err}"), None, None)
                         } else if tx_val.get("to").is_some() && tx_val.get("data").is_some() {
-                            (true, "Mint tx generated by MintGo (not independently verified)".to_string(), None)
+                            remaining = compute_remaining(true);
+                            (true, "Mint tx generated by MintGo (not independently verified)".to_string(), None, None)
                         } else {
-                            (false, "Eligibility unknown: MintGo response had no transaction".to_string(), None)
+                            (false, "Eligibility unknown: MintGo response had no transaction".to_string(), None, None)
                         }
+                    } else if !wallet_state_known && stages.is_empty() && intel_minted.is_none() {
+                        (false, format!("Eligibility unknown / Simulation failed: {last_revert}"), None, None)
                     } else {
-                        (false, format!("Contract Reverted: {last_revert}"), None)
+                        (false, format!("Contract Reverted: {last_revert}"), None, None)
                     }
                 }
             }
@@ -213,6 +228,7 @@ impl EligibilityChecker {
                 price_eth,
                 status_reason,
                 simulated_gas_used: simulated_gas,
+                detected_mint_function,
             },
             opensea_eligibility,
         })

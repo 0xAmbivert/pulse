@@ -160,55 +160,80 @@ impl DropConfig {
             return Err("Mint function signature cannot be empty".to_string());
         }
 
+        let open_paren = func_sig
+            .find('(')
+            .ok_or_else(|| format!("Invalid function signature '{func_sig}': missing '('"))?;
+        let close_paren = func_sig
+            .rfind(')')
+            .ok_or_else(|| format!("Invalid function signature '{func_sig}': missing ')'"))?;
+        if close_paren < open_paren {
+            return Err(format!("Invalid function signature '{func_sig}'"));
+        }
+
         let hash = alloy::primitives::keccak256(func_sig.as_bytes());
         let mut data = hash[0..4].to_vec();
 
-        // Parameter-less mints (e.g. mint(), claim(), publicMint())
-        if func_sig.ends_with("()") {
+        let params_str = func_sig[open_paren + 1..close_paren].trim();
+        if params_str.is_empty() {
             return Ok(data);
         }
 
-        // Allowlist Merkle proof mints: bytes32[]
-        if func_sig.contains("bytes32[]") {
-            let proof_bytes = encode_bytes32_slice(&self.merkle_proof)?;
-            if func_sig.contains("address") && func_sig.contains("uint256") {
-                data.extend_from_slice(&encode_address_word(caller)?);
-                data.extend_from_slice(&u256_word(quantity));
-                data.extend_from_slice(&u256_word(96));
-            } else if func_sig.contains("uint256") {
-                data.extend_from_slice(&u256_word(quantity));
-                data.extend_from_slice(&u256_word(64));
-            } else if func_sig.contains("address") {
-                data.extend_from_slice(&encode_address_word(caller)?);
-                data.extend_from_slice(&u256_word(64));
-            } else {
-                data.extend_from_slice(&u256_word(32));
+        let params: Vec<&str> = params_str.split(',').map(str::trim).collect();
+        let head_words = params.len();
+        let mut head = Vec::with_capacity(head_words * 32);
+        let mut tail = Vec::new();
+        let mut uint_seen = 0usize;
+
+        for param in params {
+            match param {
+                "address" => {
+                    head.extend_from_slice(&encode_address_word(caller)?);
+                }
+                "uint256" | "uint128" | "uint64" | "uint32" | "uint16" | "uint8" => {
+                    let val = if uint_seen == 0 {
+                        quantity
+                    } else {
+                        self.allowlist_wallet_limit.unwrap_or(quantity)
+                    };
+                    uint_seen += 1;
+                    head.extend_from_slice(&u256_word(val));
+                }
+                "bool" => {
+                    head.extend_from_slice(&u256_word(0));
+                }
+                "bytes32" => {
+                    if let Some(first_proof) = self.merkle_proof.first() {
+                        let clean = first_proof.trim().trim_start_matches("0x");
+                        if clean.len() != 64 {
+                            return Err(format!("bytes32 argument must be 64 hex chars, got '{first_proof}'"));
+                        }
+                        let bytes = hex::decode(clean)
+                            .map_err(|e| format!("Invalid hex in bytes32 argument: {e}"))?;
+                        head.extend_from_slice(&bytes);
+                    } else {
+                        head.extend_from_slice(&[0u8; 32]);
+                    }
+                }
+                "bytes32[]" => {
+                    let offset = (head_words * 32 + tail.len()) as u64;
+                    head.extend_from_slice(&u256_word(offset));
+                    tail.extend_from_slice(&encode_bytes32_slice(&self.merkle_proof)?);
+                }
+                "bytes" => {
+                    let offset = (head_words * 32 + tail.len()) as u64;
+                    head.extend_from_slice(&u256_word(offset));
+                    tail.extend_from_slice(&u256_word(0));
+                }
+                other => {
+                    return Err(format!(
+                        "Unsupported ABI parameter '{other}' in '{func_sig}'; provide custom_calldata_hex instead"
+                    ));
+                }
             }
-            data.extend_from_slice(&proof_bytes);
-            return Ok(data);
         }
 
-        // Recipient mints: mint(address,uint256)
-        if func_sig.contains("address,uint256") {
-            let addr_bytes = encode_address_word(caller)?;
-            data.extend_from_slice(&addr_bytes);
-            data.extend_from_slice(&u256_word(quantity));
-            return Ok(data);
-        }
-
-        // Quantity mints: mint(uint256)
-        if func_sig.contains("uint256") && !func_sig.contains("address") {
-            data.extend_from_slice(&u256_word(quantity));
-            return Ok(data);
-        }
-
-        // Address only mints: mint(address)
-        if func_sig.contains("address") && !func_sig.contains("uint256") {
-            let addr_bytes = encode_address_word(caller)?;
-            data.extend_from_slice(&addr_bytes);
-            return Ok(data);
-        }
-
+        data.extend_from_slice(&head);
+        data.extend_from_slice(&tail);
         Ok(data)
     }
 
@@ -294,7 +319,7 @@ impl DropConfig {
                     caller,
                     quantity,
                     self.allowlist_end_time.unwrap_or(u64::MAX),
-                    self.allowlist_stage_index.unwrap_or(0),
+                    self.allowlist_stage_index.unwrap_or(1),
                     self.allowlist_max_supply.unwrap_or(0),
                     self.allowlist_fee_bps.unwrap_or(0),
                     self.allowlist_wallet_limit.unwrap_or(quantity),
@@ -409,6 +434,42 @@ mod tests {
         let calldata = drop.build_calldata_for_caller(Some(caller), 1).unwrap();
         assert_eq!(calldata.len(), 4 + 32 + 32);
         assert_eq!(calldata[67], 1);
+
+        // Reversed argument order: mint(uint256,address)
+        let drop_rev = DropConfig { mint_function: "mint(uint256,address)".to_string(), ..Default::default() };
+        let cd_rev = drop_rev.build_calldata_for_caller(Some(caller), 5).unwrap();
+        assert_eq!(cd_rev.len(), 4 + 32 + 32);
+        assert_eq!(cd_rev[35], 5);
+        assert_eq!(cd_rev[67], 0x11);
+    }
+
+    #[test]
+    fn test_calldata_builder_multi_uint_and_reordered_proof() {
+        let proof_elem = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let drop = DropConfig {
+            mint_function: "allowlistMint(uint256,uint256,bytes32[])".to_string(),
+            merkle_proof: vec![proof_elem.clone()],
+            allowlist_wallet_limit: Some(10),
+            ..Default::default()
+        };
+        let cd = drop.build_calldata_for_caller(None, 2).unwrap();
+        // 4 (sel) + 32 (qty=2) + 32 (limit=10) + 32 (offset=96) + 32 (len=1) + 32 (proof)
+        assert_eq!(cd.len(), 4 + 32 * 5);
+        assert_eq!(cd[35], 2);
+        assert_eq!(cd[67], 10);
+        assert_eq!(cd[99], 96);
+        assert_eq!(cd[131], 1);
+
+        // Proof before quantity: mint(bytes32[],uint256)
+        let drop_proof_first = DropConfig {
+            mint_function: "mint(bytes32[],uint256)".to_string(),
+            merkle_proof: vec![proof_elem],
+            ..Default::default()
+        };
+        let cd2 = drop_proof_first.build_calldata_for_caller(None, 4).unwrap();
+        assert_eq!(cd2.len(), 4 + 32 * 4);
+        assert_eq!(cd2[35], 64); // offset to bytes32[] is 2 head words = 64
+        assert_eq!(cd2[67], 4);  // quantity in second head word
     }
 
     #[test]

@@ -56,6 +56,33 @@ impl WalletWorker {
         max_priority_fee_wei: u128,
         explicit_nonce: Option<u64>,
     ) -> Result<(String, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let (raw_hex, _, nonce) = self.build_and_sign_eip1559_with_hash(
+            chain_id,
+            to_address,
+            calldata,
+            value_wei,
+            gas_limit,
+            max_fee_wei,
+            max_priority_fee_wei,
+            explicit_nonce,
+        )?;
+        Ok((raw_hex, nonce))
+    }
+
+    /// Fast-signs an EIP-1559 transaction and computes its EIP-2718 keccak256 hash directly
+    /// from the encoded byte buffer without a redundant hex-decode round-trip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_and_sign_eip1559_with_hash(
+        &self,
+        chain_id: u64,
+        to_address: &str,
+        calldata: &[u8],
+        value_wei: u128,
+        gas_limit: u64,
+        max_fee_wei: u128,
+        max_priority_fee_wei: u128,
+        explicit_nonce: Option<u64>,
+    ) -> Result<(String, String, u64), Box<dyn std::error::Error + Send + Sync>> {
         let target_addr = Address::from_str(to_address)?;
         let reserved = explicit_nonce.is_none();
         let nonce = explicit_nonce.unwrap_or_else(|| self.nonce_mgr.get_and_increment());
@@ -89,11 +116,12 @@ impl WalletWorker {
         let signed_tx = tx.into_signed(signature);
 
         // Encode into standard EIP-2718 typed transaction payload
-        let mut encoded = Vec::with_capacity(256);
+        let mut encoded = Vec::with_capacity(128 + calldata.len());
         signed_tx.encode_2718(&mut encoded);
 
-        let raw_hex = format!("0x{}", hex::encode(encoded));
-        Ok((raw_hex, nonce))
+        let tx_hash = format!("{:#x}", alloy::primitives::keccak256(&encoded));
+        let raw_hex = format!("0x{}", hex::encode(&encoded));
+        Ok((raw_hex, tx_hash, nonce))
     }
 }
 

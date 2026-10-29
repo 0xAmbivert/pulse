@@ -56,6 +56,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Setup Engine Components
     let rpc_racer = Arc::new(RpcRacer::new(&config.chain.rpc_urls, config.chain.rpc_timeout_ms));
+    let endpoints = rpc_racer.endpoints();
+    if !endpoints.iter().any(|ep| ep.is_healthy()) {
+        println!("❌ FATAL: No usable HTTP RPC endpoints found (empty list, or only WebSocket URLs). Please check config.toml.");
+        return Ok(());
+    }
+    let primary_http_url = endpoints
+        .iter()
+        .find(|ep| ep.is_healthy())
+        .map(|ep| ep.url.clone())
+        .unwrap_or_default();
+
     // The user's Max Gas Fee is the per-tx cap, bounded by the hard ceiling from config.
     let effective_cap_gwei = config.gas.max_fee_gwei.min(config.gas.hard_gas_ceiling_gwei);
     let gas_engine = Arc::new(GasEngine::new(effective_cap_gwei, config.gas.max_priority_fee_gwei, config.gas.speedup_bump_percent));
@@ -65,18 +76,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.alerts.telegram_chat_id.clone(),
     ));
 
-    let mut workers = Vec::new();
+    let mut raw_workers = Vec::with_capacity(keys.len());
     for key in keys {
-        let addr = pulse::crypto::get_address_from_protected(&key)?;
         let worker = WalletWorker::new(key, 0)?;
-        if let Some(ep) = rpc_racer.endpoints().first() {
-            if let Err(e) = worker.nonce_mgr.resync_from_rpc(&ep.url).await {
-                println!("⚠️ Failed to fetch nonce for {}: {}", addr, e);
+        raw_workers.push(Arc::new(worker));
+    }
+
+    // Parallel nonce synchronization across all healthy RPC endpoints
+    let nonce_futures = raw_workers.iter().map(|w| {
+        let racer = rpc_racer.clone();
+        let worker = w.clone();
+        async move {
+            match racer.fetch_pending_transaction_count(&worker.address).await {
+                Some(nonce) => {
+                    worker.nonce_mgr.set_nonce(nonce);
+                    println!("🔓 Active RAM wallet initialized: {} (Nonce: {})", worker.address, nonce);
+                }
+                None => {
+                    println!("⚠️ Failed to fetch pending nonce for {}; defaulting to 0", worker.address);
+                }
             }
         }
-        println!("🔓 Active RAM wallet initialized: {} (Nonce: {})", addr, worker.nonce_mgr.current());
-        workers.push(Arc::new(worker));
-    }
+    });
+    futures::future::join_all(nonce_futures).await;
+    let workers = raw_workers;
 
     use std::io::IsTerminal;
     let is_piped = std::env::var("PULSE_ALLOW_PIPED_KEY").as_deref() == Ok("1");
@@ -116,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.current_base_fee = 0.0;
     state.add_log(format!("🧢 Max fee cap: {:.2} Gwei", effective_cap_gwei));
 
-    let mut events = EventHandler::new(250);
+    let mut events = EventHandler::new_with_mode(250, headless);
     let (trigger_tx, mut trigger_rx) = mpsc::channel::<SnipeTrigger>(10);
     let (ui_log_tx, mut ui_log_rx) = mpsc::channel::<String>(100);
 
@@ -136,35 +159,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let target_contract = config.drop.target_contract.clone();
     let rpc_racer_clone = rpc_racer.clone();
 
-    // Pre-flight wallet balance check: balance >= total mint value + (gas_limit * max_fee_wei)
+    // Pre-flight wallet balance check in parallel: balance >= total mint value + (gas_limit * max_fee_wei)
     let max_fee_wei = pulse::gas::gwei_to_wei(effective_cap_gwei);
     let unit_val_wei = config.drop.mint_value_wei.trim().parse::<u128>().unwrap_or(0);
     let mint_val_wei = unit_val_wei.saturating_mul(config.drop.mint_quantity as u128);
     let needed_wei = mint_val_wei.saturating_add((config.gas.gas_limit as u128).saturating_mul(max_fee_wei));
-    for w in &workers {
-        if let Some(bal) = rpc_racer.fetch_balance(&w.address).await {
+    let bal_futures = workers.iter().map(|w| {
+        let racer = rpc_racer.clone();
+        let addr = w.address.clone();
+        async move { (addr.clone(), racer.fetch_balance(&addr).await) }
+    });
+    for (addr, maybe_bal) in futures::future::join_all(bal_futures).await {
+        if let Some(bal) = maybe_bal {
             if bal < needed_wei {
                 let deficit_eth = (needed_wei - bal) as f64 / 1e18;
-                state.add_log(format!("⚠️ Insufficient balance for {}: deficit {:.6} ETH", w.address, deficit_eth));
+                state.add_log(format!("⚠️ Insufficient balance for {}: deficit {:.6} ETH", addr, deficit_eth));
             } else {
-                state.add_log(format!("💰 Wallet {} balance verified: {:.4} ETH", w.address, bal as f64 / 1e18));
+                state.add_log(format!("💰 Wallet {} balance verified: {:.4} ETH", addr, bal as f64 / 1e18));
             }
         }
     }
 
-    // 🔥 WIRING UP ALL SNIPERS & ENGINES TO FIX DEAD ENDS 🔥
-
-    // 1. Network/RPC Checks
-    //
-    // This runs BEFORE the trigger wiring below: the Mempool and StatePoller modes index
-    // `rpc_urls[0]`, so an empty RPC list used to panic here rather than report a clear error.
-    // WebSocket-only configs are also rejected, since RpcRacer marks them inactive and every
-    // dispatch would silently race zero endpoints.
-    let endpoints = rpc_racer.endpoints();
-    if !endpoints.iter().any(|ep| ep.is_healthy()) {
-        println!("❌ FATAL: No usable RPC endpoints found (empty list, or only WebSocket URLs). Please check config.toml.");
-        return Ok(());
-    }
     state.add_log(format!("🌐 Active RPC Endpoints: {}", endpoints.iter().filter(|e| e.is_healthy()).count()));
 
     // 2. Exclusive Trigger Mode Spawning
@@ -186,14 +201,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .ws_rpc_url
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
-                .or_else(|| config.chain.rpc_urls.first().map(String::as_str))
+                .or(Some(primary_http_url.as_str()))
                 .unwrap_or_default();
             if mempool_rpc.is_empty() {
                 state.add_log("⚠️ Mempool mode selected but no RPC/WebSocket URL is configured.".to_string());
             } else {
                 let scanner = MempoolScanner::with_http_fallback(
                     mempool_rpc,
-                    config.chain.rpc_urls.first().cloned(),
+                    Some(primary_http_url.clone()),
                     &target_contract,
                     config.drop.monitor_owner_address.clone(),
                     &config.drop.mempool_flip_signatures,
@@ -206,8 +221,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         TriggerMode::StatePoller => {
             if !config.drop.flip_function_signatures.is_empty() {
-                let rpc = config.chain.rpc_urls.first().cloned().unwrap_or_default();
-                let poller = StatePoller::new(&rpc, &target_contract, &config.drop.flip_function_signatures);
+                let poller = StatePoller::with_pool(
+                    &config.chain.rpc_urls,
+                    &target_contract,
+                    &config.drop.flip_function_signatures,
+                );
                 let tx_c = trigger_tx.clone();
                 tokio::spawn(async move { poller.run_poll_loop(tx_c).await; });
                 state.add_log("🔄 Armed On-Chain State Poller".to_string());
@@ -215,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    // 2. MEV Builder Client
+    // 3. MEV Builder Client
     // Chain-aware builder routing: Only Ethereum L1 (chain_id == 1, Sepolia 11155111, Goerli 5) support Flashbots/Titan/Beaver
     let is_l1 = config.chain.chain_id == 1 || config.chain.chain_id == 11155111 || config.chain.chain_id == 5;
     let mev_client = if is_l1 && !config.chain.mev_builder_urls.is_empty() {
@@ -240,20 +258,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &config.drop,
         config.drop.mint_quantity,
     );
-    if let (Ok(calldata), Ok(sim_val)) = (sim_calldata, sim_val) {
-        let simulator = RpcSimulator::new(&endpoints[0].url);
-        match simulator.simulate_call(&workers[0].address, sim_dest, &calldata, sim_val, config.gas.gas_limit).await {
-            Ok(Some(sim_res)) if !sim_res.success => state.add_log(format!(
-                "⚠️ Advisory simulation reverted: {:?}. The drop will almost certainly fail on-chain.",
-                sim_res.revert_reason
-            )),
-            Ok(Some(sim_res)) => state.add_log(format!("✅ Pre-flight simulation passed ({} gas)", sim_res.gas_used)),
-            Ok(None) => state.add_log("⚠️ Pre-flight simulation produced no result.".to_string()),
-            // A transport failure is unknown, not a revert. Say so instead of implying the
-            // contract rejected the call.
-            Err(e) => state.add_log(format!(
-                "⚠️ Pre-flight simulation unavailable ({e}); on-chain outcome unknown."
-            )),
+    match (sim_calldata, sim_val) {
+        (Ok(calldata), Ok(sim_val)) => {
+            let simulator = RpcSimulator::new(&primary_http_url);
+            match simulator.simulate_call(&workers[0].address, sim_dest, &calldata, sim_val, config.gas.gas_limit).await {
+                Ok(Some(sim_res)) if !sim_res.success => state.add_log(format!(
+                    "⚠️ Advisory simulation reverted: {:?}. The drop will almost certainly fail on-chain.",
+                    sim_res.revert_reason
+                )),
+                Ok(Some(sim_res)) => state.add_log(format!("✅ Pre-flight simulation passed ({} gas)", sim_res.gas_used)),
+                Ok(None) => state.add_log("⚠️ Pre-flight simulation produced no result.".to_string()),
+                Err(e) => state.add_log(format!(
+                    "⚠️ Pre-flight simulation unavailable ({e}); on-chain outcome unknown."
+                )),
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            state.add_log(format!("⚠️ Calldata/value configuration error: {e}"));
         }
     }
 
@@ -274,7 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             snipes
         }
         Err(e) => {
-            state.add_log(format!("⚠️ Initial base fee exceeds ceiling: {e}; holding dispatch"));
+            state.add_log(format!("⚠️ Cannot prepare transactions ({e}); holding dispatch"));
             Vec::new()
         }
     };
@@ -340,7 +361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             match prepare_snipes(&workers, &config, &target_contract, *base_fee_wei, prev_base_fee_wei, &gas_engine) {
                                 Ok(snipes) => prepared_snipes = snipes,
                                 Err(e) => {
-                                    state.add_log(format!("⚠️ Base fee ({:.2} Gwei) exceeds ceiling: {e}; holding dispatch", state.current_base_fee));
+                                    state.add_log(format!("⚠️ Holding dispatch at {:.2} Gwei base fee: {e}", state.current_base_fee));
                                     prepared_snipes.clear();
                                 }
                             }
@@ -397,23 +418,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let alerts_c = alerts.clone();
                     let allow_fallback = config.gas.allow_public_fallback;
                     tokio::spawn(async move {
-                        let target_block = racer_target.fetch_latest_block_number().await.unwrap_or(0) + 1;
-                        let outcomes = mev.send_bundle(&raw_txs, target_block).await;
-                        let accepted = outcomes.iter().any(|o| o.success);
+                        let cached_blk = racer_target.cached_block_number();
+                        let current_blk = if cached_blk > 0 {
+                            cached_blk
+                        } else {
+                            racer_target.fetch_latest_block_number().await.unwrap_or(0)
+                        };
+                        let target_block = current_blk + 1;
+                        // Target both target_block and target_block + 1 concurrently so a bundle
+                        // arriving near a slot boundary remains eligible for the next block.
+                        let (outcomes_n1, outcomes_n2) = tokio::join!(
+                            mev.send_bundle(&raw_txs, target_block),
+                            mev.send_bundle(&raw_txs, target_block + 1),
+                        );
+                        let accepted = outcomes_n1.iter().any(|o| o.success)
+                            || outcomes_n2.iter().any(|o| o.success);
 
                         if accepted {
-                            alerts_c.dispatch_alert("📦 MEV Bundle Submitted", &format!("Block: {target_block}\nOutcomes: {outcomes:?}"), true).await;
+                            alerts_c.dispatch_alert(
+                                "📦 MEV Bundle Submitted",
+                                &format!("Blocks: {target_block}..={}\nOutcomes: {outcomes_n1:?}", target_block + 1),
+                                true,
+                            ).await;
                             return;
                         }
 
                         // No builder accepted the bundle: the transactions are still unsent.
                         if allow_fallback {
-                            alerts_c.dispatch_alert("⚠️ All Builders Rejected Bundle, broadcasting to public RPC", &format!("Block: {target_block}\nOutcomes: {outcomes:?}"), false).await;
+                            alerts_c.dispatch_alert("⚠️ All Builders Rejected Bundle, broadcasting to public RPC", &format!("Block: {target_block}\nOutcomes: {outcomes_n1:?}"), false).await;
                             for raw in &raw_txs {
                                 let _ = racer_target.race_broadcast_raw_tx(raw).await;
                             }
                         } else {
-                            alerts_c.dispatch_alert("⚠️ All Builders Rejected Bundle (public fallback disabled to prevent sandwiching)", &format!("Block: {target_block}\nOutcomes: {outcomes:?}"), false).await;
+                            alerts_c.dispatch_alert("⚠️ All Builders Rejected Bundle (public fallback disabled to prevent sandwiching)", &format!("Block: {target_block}\nOutcomes: {outcomes_n1:?}"), false).await;
                         }
                     });
                 }

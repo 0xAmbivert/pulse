@@ -45,6 +45,8 @@ pub struct WalletEligibilityStatus {
     pub price_eth: f64,
     pub status_reason: String,
     pub simulated_gas_used: Option<u64>,
+    #[serde(default)]
+    pub detected_mint_function: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
